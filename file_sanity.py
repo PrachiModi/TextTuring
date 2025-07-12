@@ -1,6 +1,6 @@
 from PyQt6.QtWidgets import QDialog, QVBoxLayout, QHBoxLayout, QPushButton, QTableWidget, QTableWidgetItem, QLabel, QFileDialog, QWidget
-from PyQt6.QtCore import Qt, QUrl
-from PyQt6.QtGui import QFont, QDesktopServices
+from PyQt6.QtCore import Qt, QUrl, QEvent
+from PyQt6.QtGui import QFont, QDesktopServices, QPalette, QColor, QPixmap
 from file_numbers import analyze_files, get_files_by_type, move_file_to_trash
 from unreferenced_xmls import find_unreferenced_xmls, move_xml_to_trash
 from unreferenced_graphics import find_unreferenced_graphics, move_graphic_to_trash
@@ -10,6 +10,7 @@ from pathlib import Path
 import shutil
 from datetime import datetime
 import logging
+from markdown_viewer import MarkdownViewer
 
 # Set up logging
 logging.basicConfig(level=logging.DEBUG, format='%(asctime)s - %(levelname)s - %(message)s')
@@ -26,13 +27,16 @@ class FileListDialog(QDialog):
         self.parent_widget = parent  # Reference to FileSanityWidget
         self.is_deleting = False
 
-        # Main layout
+        self.setAutoFillBackground(True)
+        palette = self.palette()
+        palette.setColor(QPalette.ColorRole.Base, QColor("#1F252A"))
+        self.setPalette(palette)
+
         layout = QVBoxLayout()
         layout.setContentsMargins(15, 15, 15, 15)
         layout.setSpacing(10)
         self.setLayout(layout)
 
-        # Table for file list
         self.table = QTableWidget()
         self.table.setColumnCount(3)
         self.table.setHorizontalHeaderLabels(["File Name", "Folder Path", "Delete Button"])
@@ -43,27 +47,23 @@ class FileListDialog(QDialog):
         self.table.setAlternatingRowColors(True)
         layout.addWidget(self.table, stretch=1)
 
-        # Set dynamic column widths
         header = self.table.horizontalHeader()
         header.setSectionResizeMode(0, header.ResizeMode.Stretch)
         header.setSectionResizeMode(1, header.ResizeMode.Stretch)
         header.setSectionResizeMode(2, header.ResizeMode.Fixed)
         self.table.setColumnWidth(2, 110)
-
-        # Set minimum row height
         self.table.verticalHeader().setDefaultSectionSize(30)
 
-        # Feedback label
         self.feedback_label = QLabel("")
         self.feedback_label.setFont(QFont("Helvetica", 12))
-        self.feedback_label.setStyleSheet("color: #FFFFFF;")
+        self.feedback_label.setStyleSheet("color: #121416; background-color: transparent;")
         self.feedback_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
         layout.addWidget(self.feedback_label)
 
-        # Bottom buttons
         self.bottom_panel = QHBoxLayout()
         self.delete_all_btn = QPushButton("Delete All")
         self.delete_all_btn.setFont(QFont("Helvetica", 12, QFont.Weight.Medium))
+        self.delete_all_btn.setMinimumSize(150, 30)
         self.delete_all_btn.setStyleSheet("""
             QPushButton {
                 background-color: #FF8C00;
@@ -71,8 +71,9 @@ class FileListDialog(QDialog):
                 padding: 5px 10px;
                 border-radius: 4px;
                 border: 1px solid #CC7000;
-                min-width: 60px;
-                min-height: 24px;
+                box-shadow: none;
+                min-width: 150px;
+                min-height: 30px;
             }
             QPushButton:hover {
                 background-color: #FFA500;
@@ -85,11 +86,12 @@ class FileListDialog(QDialog):
         """)
         self.back_btn = QPushButton("Back")
         self.back_btn.setFont(QFont("Helvetica", 12, QFont.Weight.Medium))
+        self.back_btn.setMinimumSize(150, 30)
+        self.back_btn.setStyleSheet("background-color: #0D6E6E; color: #FFFFFF; padding: 5px 10px; border-radius: 4px; border: 1px solid #0A5555; box-shadow: none;")
         self.bottom_panel.addWidget(self.delete_all_btn)
         self.bottom_panel.addWidget(self.back_btn)
         layout.addLayout(self.bottom_panel)
 
-        # Apply styling
         self.setStyleSheet("""
             QDialog {
                 background-color: #1F252A;
@@ -100,8 +102,9 @@ class FileListDialog(QDialog):
                 padding: 5px 10px;
                 border-radius: 4px;
                 border: 1px solid #0A5555;
-                min-width: 60px;
-                min-height: 24px;
+                box-shadow: none;
+                min-width: 150px;
+                min-height: 30px;
             }
             QPushButton:hover {
                 background-color: #139999;
@@ -112,26 +115,24 @@ class FileListDialog(QDialog):
                 border: 1px solid #555555;
             }
             QTableWidget {
-                background-color: #FFFFFF;
+                background-color: #E6ECEF;
                 color: #121416;
                 border-radius: 4px;
                 padding: 3px;
             }
             QTableWidget::item {
-                background-color: #FFFFFF;
+                background-color: #E6ECEF;
                 padding: 2px;
                 margin: 0px;
             }
             QTableWidget QLabel {
-                background-color: #FFFFFF;
+                background-color: #E6ECEF;
             }
         """)
 
-        # Connect signals
         self.delete_all_btn.clicked.connect(self.handle_delete_all)
         self.back_btn.clicked.connect(self.accept)
 
-        # Populate table
         self.populate_table()
 
     def populate_table(self):
@@ -155,6 +156,7 @@ class FileListDialog(QDialog):
                 if action == "Delete":
                     delete_btn = QPushButton("Delete")
                     delete_btn.setFont(QFont("Helvetica", 9))
+                    delete_btn.setMinimumSize(48, 18)
                     delete_btn.setStyleSheet("""
                         QPushButton {
                             background-color: #FF8C00;
@@ -162,6 +164,7 @@ class FileListDialog(QDialog):
                             padding: 1px 2px;
                             border-radius: 4px;
                             border: 1px solid #CC7000;
+                            box-shadow: none;
                             min-width: 48px;
                             min-height: 18px;
                             text-align: center;
@@ -270,37 +273,160 @@ class FileSanityWidget(QWidget):
         self.delete_unnecessary_dir = ""
         self.is_deleting = False
         self.current_mode = ""
+        self.button_info_labels = {}  # Store info labels for buttons
+        self.markdown_viewers = []  # Track Markdown viewers
 
-        # Main layout
+        self.setAutoFillBackground(True)
+        palette = self.palette()
+        palette.setColor(QPalette.ColorRole.Base, QColor("#1F252A"))
+        self.setPalette(palette)
+
         layout = QVBoxLayout()
         layout.setContentsMargins(15, 15, 15, 15)
-        layout.setSpacing(10)
+        layout.setSpacing(10)  # Increased spacing
         self.setLayout(layout)
 
-        # Top buttons
         button_panel = QHBoxLayout()
+        button_panel.setContentsMargins(0, 0, 0, 0)
+        button_panel.setSpacing(8)
+
+        # File Analytics section
+        file_analytics_layout = QVBoxLayout()
+        file_analytics_layout.setSpacing(10)  # Increased spacing
+        file_analytics_icon_container = QWidget()
+        file_analytics_icon_container.setFixedHeight(30)  # Increased height
+        file_analytics_icon_layout = QHBoxLayout()
+        file_analytics_icon_container.setLayout(file_analytics_icon_layout)
+        file_analytics_icon_container.setStyleSheet("background-color: transparent; margin-top: 2px;")  # Added top margin
+        file_analytics_info_label = QLabel()
+        file_analytics_info_label.setAlignment(Qt.AlignmentFlag.AlignCenter)  # Center the icon
+        file_analytics_info_label.setFixedSize(16, 16)  # Fixed size for icon
+        icon_path = os.path.join(os.path.dirname(__file__), "icon.png")
+        if os.path.exists(icon_path):
+            pixmap = QPixmap(icon_path).scaled(16, 16, Qt.AspectRatioMode.KeepAspectRatio)
+            file_analytics_info_label.setPixmap(pixmap)
+            file_analytics_info_label.update()  # Force repaint
+        else:
+            pixmap = QPixmap(16, 16)
+            pixmap.fill(Qt.GlobalColor.transparent)
+            file_analytics_info_label.setPixmap(pixmap)
+        file_analytics_info_label.setCursor(Qt.CursorShape.PointingHandCursor)
+        file_analytics_info_label.setVisible(True)  # Default visible
+        file_analytics_info_label.mousePressEvent = lambda event: self.open_markdown_help("File Analytics")
+        self.button_info_labels["File Analytics"] = file_analytics_info_label
+        file_analytics_icon_layout.addWidget(file_analytics_info_label)
         self.file_analytics_btn = QPushButton("File Analytics")
         self.file_analytics_btn.setFont(QFont("Helvetica", 12, QFont.Weight.Medium))
+        self.file_analytics_btn.setMinimumSize(150, 30)
+        self.file_analytics_btn.setStyleSheet("background-color: #0D6E6E; color: #FFFFFF; padding: 5px 10px; border-radius: 4px; border: 1px solid #0A5555; box-shadow: none;")
+        file_analytics_layout.addWidget(file_analytics_icon_container)
+        file_analytics_layout.addWidget(self.file_analytics_btn)
+        button_panel.addLayout(file_analytics_layout)
+
+        # Delete Unnecessary Folders section
+        delete_unnecessary_layout = QVBoxLayout()
+        delete_unnecessary_layout.setSpacing(10)  # Increased spacing
+        delete_unnecessary_icon_container = QWidget()
+        delete_unnecessary_icon_container.setFixedHeight(30)  # Increased height
+        delete_unnecessary_icon_layout = QHBoxLayout()
+        delete_unnecessary_icon_container.setLayout(delete_unnecessary_icon_layout)
+        delete_unnecessary_icon_container.setStyleSheet("background-color: transparent; margin-top: 2px;")  # Added top margin
+        delete_unnecessary_info_label = QLabel()
+        delete_unnecessary_info_label.setAlignment(Qt.AlignmentFlag.AlignCenter)  # Center the icon
+        delete_unnecessary_info_label.setFixedSize(16, 16)  # Fixed size for icon
+        if os.path.exists(icon_path):
+            pixmap = QPixmap(icon_path).scaled(16, 16, Qt.AspectRatioMode.KeepAspectRatio)
+            delete_unnecessary_info_label.setPixmap(pixmap)
+            delete_unnecessary_info_label.update()  # Force repaint
+        else:
+            pixmap = QPixmap(16, 16)
+            pixmap.fill(Qt.GlobalColor.transparent)
+            delete_unnecessary_info_label.setPixmap(pixmap)
+        delete_unnecessary_info_label.setCursor(Qt.CursorShape.PointingHandCursor)
+        delete_unnecessary_info_label.setVisible(True)  # Default visible
+        delete_unnecessary_info_label.mousePressEvent = lambda event: self.open_markdown_help("Delete Unnecessary Folders")
+        self.button_info_labels["Delete Unnecessary Folders"] = delete_unnecessary_info_label
+        delete_unnecessary_icon_layout.addWidget(delete_unnecessary_info_label)
         self.delete_unnecessary_btn = QPushButton("Delete Unnecessary Folders")
         self.delete_unnecessary_btn.setFont(QFont("Helvetica", 12, QFont.Weight.Medium))
+        self.delete_unnecessary_btn.setMinimumSize(150, 30)
+        self.delete_unnecessary_btn.setStyleSheet("background-color: #0D6E6E; color: #FFFFFF; padding: 5px 10px; border-radius: 4px; border: 1px solid #0A5555; box-shadow: none;")
+        delete_unnecessary_layout.addWidget(delete_unnecessary_icon_container)
+        delete_unnecessary_layout.addWidget(self.delete_unnecessary_btn)
+        button_panel.addLayout(delete_unnecessary_layout)
+
+        # Check Unreferenced XMLs section
+        check_unreferenced_layout = QVBoxLayout()
+        check_unreferenced_layout.setSpacing(10)  # Increased spacing
+        check_unreferenced_icon_container = QWidget()
+        check_unreferenced_icon_container.setFixedHeight(30)  # Increased height
+        check_unreferenced_icon_layout = QHBoxLayout()
+        check_unreferenced_icon_container.setLayout(check_unreferenced_icon_layout)
+        check_unreferenced_icon_container.setStyleSheet("background-color: transparent; margin-top: 2px;")  # Added top margin
+        check_unreferenced_info_label = QLabel()
+        check_unreferenced_info_label.setAlignment(Qt.AlignmentFlag.AlignCenter)  # Center the icon
+        check_unreferenced_info_label.setFixedSize(16, 16)  # Fixed size for icon
+        if os.path.exists(icon_path):
+            pixmap = QPixmap(icon_path).scaled(16, 16, Qt.AspectRatioMode.KeepAspectRatio)
+            check_unreferenced_info_label.setPixmap(pixmap)
+            check_unreferenced_info_label.update()  # Force repaint
+        else:
+            pixmap = QPixmap(16, 16)
+            pixmap.fill(Qt.GlobalColor.transparent)
+            check_unreferenced_info_label.setPixmap(pixmap)
+        check_unreferenced_info_label.setCursor(Qt.CursorShape.PointingHandCursor)
+        check_unreferenced_info_label.setVisible(True)  # Default visible
+        check_unreferenced_info_label.mousePressEvent = lambda event: self.open_markdown_help("Check Unreferenced XMLs")
+        self.button_info_labels["Check Unreferenced XMLs"] = check_unreferenced_info_label
+        check_unreferenced_icon_layout.addWidget(check_unreferenced_info_label)
         self.check_unreferenced_btn = QPushButton("Check Unreferenced XMLs")
         self.check_unreferenced_btn.setFont(QFont("Helvetica", 12, QFont.Weight.Medium))
+        self.check_unreferenced_btn.setMinimumSize(150, 30)
+        self.check_unreferenced_btn.setStyleSheet("background-color: #0D6E6E; color: #FFFFFF; padding: 5px 10px; border-radius: 4px; border: 1px solid #0A5555; box-shadow: none;")
+        check_unreferenced_layout.addWidget(check_unreferenced_icon_container)
+        check_unreferenced_layout.addWidget(self.check_unreferenced_btn)
+        button_panel.addLayout(check_unreferenced_layout)
+
+        # Check Unreferenced Graphics section
+        check_unreferenced_graphics_layout = QVBoxLayout()
+        check_unreferenced_graphics_layout.setSpacing(10)  # Increased spacing
+        check_unreferenced_graphics_icon_container = QWidget()
+        check_unreferenced_graphics_icon_container.setFixedHeight(30)  # Increased height
+        check_unreferenced_graphics_icon_layout = QHBoxLayout()
+        check_unreferenced_graphics_icon_container.setLayout(check_unreferenced_graphics_icon_layout)
+        check_unreferenced_graphics_icon_container.setStyleSheet("background-color: transparent; margin-top: 2px;")  # Added top margin
+        check_unreferenced_graphics_info_label = QLabel()
+        check_unreferenced_graphics_info_label.setAlignment(Qt.AlignmentFlag.AlignCenter)  # Center the icon
+        check_unreferenced_graphics_info_label.setFixedSize(16, 16)  # Fixed size for icon
+        if os.path.exists(icon_path):
+            pixmap = QPixmap(icon_path).scaled(16, 16, Qt.AspectRatioMode.KeepAspectRatio)
+            check_unreferenced_graphics_info_label.setPixmap(pixmap)
+            check_unreferenced_graphics_info_label.update()  # Force repaint
+        else:
+            pixmap = QPixmap(16, 16)
+            pixmap.fill(Qt.GlobalColor.transparent)
+            check_unreferenced_graphics_info_label.setPixmap(pixmap)
+        check_unreferenced_graphics_info_label.setCursor(Qt.CursorShape.PointingHandCursor)
+        check_unreferenced_graphics_info_label.setVisible(True)  # Default visible
+        check_unreferenced_graphics_info_label.mousePressEvent = lambda event: self.open_markdown_help("Check Unreferenced Graphics")
+        self.button_info_labels["Check Unreferenced Graphics"] = check_unreferenced_graphics_info_label
+        check_unreferenced_graphics_icon_layout.addWidget(check_unreferenced_graphics_info_label)
         self.check_unreferenced_graphics_btn = QPushButton("Check Unreferenced Graphics")
         self.check_unreferenced_graphics_btn.setFont(QFont("Helvetica", 12, QFont.Weight.Medium))
-        button_panel.addWidget(self.delete_unnecessary_btn)
-        button_panel.addWidget(self.file_analytics_btn)
-        button_panel.addWidget(self.check_unreferenced_btn)
-        button_panel.addWidget(self.check_unreferenced_graphics_btn)
+        self.check_unreferenced_graphics_btn.setMinimumSize(150, 30)
+        self.check_unreferenced_graphics_btn.setStyleSheet("background-color: #0D6E6E; color: #FFFFFF; padding: 5px 10px; border-radius: 4px; border: 1px solid #0A5555; box-shadow: none;")
+        check_unreferenced_graphics_layout.addWidget(check_unreferenced_graphics_icon_container)
+        check_unreferenced_graphics_layout.addWidget(self.check_unreferenced_graphics_btn)
+        button_panel.addLayout(check_unreferenced_graphics_layout)
+
         layout.addLayout(button_panel)
 
-        # Feedback label
         self.feedback_label = QLabel("Select a check to begin")
         self.feedback_label.setFont(QFont("Helvetica", 14, QFont.Weight.Medium))
-        self.feedback_label.setStyleSheet("color: #FFFFFF;")
+        self.feedback_label.setStyleSheet("color: #FFFFFF; background-color: transparent;")  # Changed text color to white
         self.feedback_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
         layout.addWidget(self.feedback_label)
 
-        # Table (initially hidden)
         self.table = QTableWidget()
         self.table.setColumnCount(3)
         self.table.setHorizontalHeaderLabels(["File Type", "No. of Files", "Action"])
@@ -311,8 +437,6 @@ class FileSanityWidget(QWidget):
         self.table.setAlternatingRowColors(False)
         self.table.setRowCount(0)
         self.table.setVisible(False)
-
-        # Set dynamic column widths
         header = self.table.horizontalHeader()
         header.setSectionResizeMode(0, header.ResizeMode.Stretch)
         header.setSectionResizeMode(1, header.ResizeMode.Stretch)
@@ -321,10 +445,10 @@ class FileSanityWidget(QWidget):
         self.table.verticalHeader().setDefaultSectionSize(30)
         layout.addWidget(self.table, stretch=1)
 
-        # Bottom buttons
         self.bottom_panel = QHBoxLayout()
         self.delete_all_btn = QPushButton("Delete All")
         self.delete_all_btn.setFont(QFont("Helvetica", 12, QFont.Weight.Medium))
+        self.delete_all_btn.setMinimumSize(150, 30)
         self.delete_all_btn.setStyleSheet("""
             QPushButton {
                 background-color: #FF8C00;
@@ -332,8 +456,9 @@ class FileSanityWidget(QWidget):
                 padding: 5px 10px;
                 border-radius: 4px;
                 border: 1px solid #CC7000;
-                min-width: 60px;
-                min-height: 24px;
+                box-shadow: none;
+                min-width: 150px;
+                min-height: 30px;
             }
             QPushButton:hover {
                 background-color: #FFA500;
@@ -347,11 +472,12 @@ class FileSanityWidget(QWidget):
         self.delete_all_btn.setVisible(False)
         self.back_btn = QPushButton("Back to Menu")
         self.back_btn.setFont(QFont("Helvetica", 12, QFont.Weight.Medium))
+        self.back_btn.setMinimumSize(150, 30)
+        self.back_btn.setStyleSheet("background-color: #0D6E6E; color: #FFFFFF; padding: 5px 10px; border-radius: 4px; border: 1px solid #0A5555; box-shadow: none;")
         self.bottom_panel.addWidget(self.delete_all_btn)
         self.bottom_panel.addWidget(self.back_btn)
         layout.addLayout(self.bottom_panel)
 
-        # Apply styling
         self.setStyleSheet("""
             QWidget {
                 background-color: #1F252A;
@@ -362,8 +488,9 @@ class FileSanityWidget(QWidget):
                 padding: 5px 10px;
                 border-radius: 4px;
                 border: 1px solid #0A5555;
-                min-width: 60px;
-                min-height: 24px;
+                box-shadow: none;
+                min-width: 150px;
+                min-height: 30px;
             }
             QPushButton:hover {
                 background-color: #139999;
@@ -374,28 +501,48 @@ class FileSanityWidget(QWidget):
                 border: 1px solid #555555;
             }
             QTableWidget {
-                background-color: #FFFFFF;
+                background-color: #E6ECEF;
                 color: #121416;
                 border-radius: 4px;
                 padding: 3px;
             }
             QTableWidget::item {
-                background-color: #FFFFFF;
+                background-color: #E6ECEF;
                 padding: 2px;
                 margin: 0px;
             }
             QTableWidget QLabel {
-                background-color: #FFFFFF;
+                background-color: #E6ECEF;
             }
         """)
 
-        # Connect signals
         self.file_analytics_btn.clicked.connect(self.handle_file_analytics)
         self.delete_unnecessary_btn.clicked.connect(self.handle_delete_directory)
         self.check_unreferenced_btn.clicked.connect(self.handle_check_unreferenced_xmls)
         self.check_unreferenced_graphics_btn.clicked.connect(self.handle_check_unreferenced_graphics)
         self.delete_all_btn.clicked.connect(self.handle_delete_all)
         self.back_btn.clicked.connect(self.parent_window.return_to_main_menu)
+
+    def showEvent(self, event: QEvent):
+        """Handle widget show event to update help icons."""
+        super().showEvent(event)
+        self.update_help_ui()
+
+    def open_markdown_help(self, button_name):
+        """Open the corresponding .md file for the button."""
+        md_name = button_name.lower().replace(" ", "_") + ".md"
+        md_path = os.path.join(os.path.dirname(__file__), "docs", md_name)
+        if not os.path.exists(md_path):
+            return
+        viewer = MarkdownViewer(md_path, button_name, self.parent_window)
+        viewer.show()
+        self.markdown_viewers.append(viewer)
+
+    def update_help_ui(self):
+        """Show/hide info icons based on parent window's help_enabled state."""
+        help_enabled = self.parent_window.help_enabled if self.parent_window else False
+        for label_name, label in self.button_info_labels.items():
+            label.setVisible(help_enabled)
 
     def handle_delete_directory(self):
         self.logger.debug("Handling Delete Unnecessary Folders")
@@ -454,6 +601,7 @@ class FileSanityWidget(QWidget):
                     if action == "View":
                         view_btn = QPushButton("View")
                         view_btn.setFont(QFont("Helvetica", 9))
+                        view_btn.setMinimumSize(48, 18)
                         view_btn.setStyleSheet("""
                             QPushButton {
                                 background-color: #0D6E6E;
@@ -461,6 +609,7 @@ class FileSanityWidget(QWidget):
                                 padding: 1px 2px;
                                 border-radius: 4px;
                                 border: 1px solid #0A5555;
+                                box-shadow: none;
                                 min-width: 48px;
                                 min-height: 18px;
                                 text-align: center;
@@ -654,7 +803,7 @@ class FileSanityWidget(QWidget):
                     file_url = QUrl.fromLocalFile(full_path).toString()
                     file_link_label = QLabel()
                     file_link_label.setText(f'<a href="{file_url}" style="color: #0000FF; text-decoration: underline;">{file_name}</a>')
-                    file_link_label.setStyleSheet("background-color: #FFFFFF;")
+                    file_link_label.setStyleSheet("background-color: #E6ECEF;")
                     file_link_label.setOpenExternalLinks(True)
                     file_link_label.setTextInteractionFlags(Qt.TextInteractionFlag.TextBrowserInteraction)
                     self.table.setCellWidget(row, 0, file_link_label)
@@ -662,12 +811,13 @@ class FileSanityWidget(QWidget):
                     folder_url = QUrl.fromLocalFile(folder_full_path).toString()
                     folder_link_label = QLabel()
                     folder_link_label.setText(f'<a href="{folder_url}" style="color: #0000FF; text-decoration: underline;">{folder_path}</a>')
-                    folder_link_label.setStyleSheet("background-color: #FFFFFF;")
+                    folder_link_label.setStyleSheet("background-color: #E6ECEF;")
                     folder_link_label.setOpenExternalLinks(True)
                     folder_link_label.setTextInteractionFlags(Qt.TextInteractionFlag.TextBrowserInteraction)
                     self.table.setCellWidget(row, 1, folder_link_label)
                     delete_btn = QPushButton("Delete")
                     delete_btn.setFont(QFont("Helvetica", 9))
+                    delete_btn.setMinimumSize(48, 18)
                     delete_btn.setStyleSheet("""
                         QPushButton {
                             background-color: #FF8C00;
@@ -675,6 +825,7 @@ class FileSanityWidget(QWidget):
                             padding: 1px 2px;
                             border-radius: 4px;
                             border: 1px solid #CC7000;
+                            box-shadow: none;
                             min-width: 48px;
                             min-height: 18px;
                             text-align: center;
@@ -739,7 +890,7 @@ class FileSanityWidget(QWidget):
                     file_url = QUrl.fromLocalFile(full_path).toString()
                     file_link_label = QLabel()
                     file_link_label.setText(f'<a href="{file_url}" style="color: #0000FF; text-decoration: underline;">{file_name}</a>')
-                    file_link_label.setStyleSheet("background-color: #FFFFFF;")
+                    file_link_label.setStyleSheet("background-color: #E6ECEF;")
                     file_link_label.setOpenExternalLinks(True)
                     file_link_label.setTextInteractionFlags(Qt.TextInteractionFlag.TextBrowserInteraction)
                     self.table.setCellWidget(row, 0, file_link_label)
@@ -747,12 +898,13 @@ class FileSanityWidget(QWidget):
                     folder_url = QUrl.fromLocalFile(folder_full_path).toString()
                     folder_link_label = QLabel()
                     folder_link_label.setText(f'<a href="{folder_url}" style="color: #0000FF; text-decoration: underline;">{folder_path}</a>')
-                    folder_link_label.setStyleSheet("background-color: #FFFFFF;")
+                    folder_link_label.setStyleSheet("background-color: #E6ECEF;")
                     folder_link_label.setOpenExternalLinks(True)
                     folder_link_label.setTextInteractionFlags(Qt.TextInteractionFlag.TextBrowserInteraction)
                     self.table.setCellWidget(row, 1, folder_link_label)
                     delete_btn = QPushButton("Delete")
                     delete_btn.setFont(QFont("Helvetica", 9))
+                    delete_btn.setMinimumSize(48, 18)
                     delete_btn.setStyleSheet("""
                         QPushButton {
                             background-color: #FF8C00;
@@ -760,6 +912,7 @@ class FileSanityWidget(QWidget):
                             padding: 1px 2px;
                             border-radius: 4px;
                             border: 1px solid #CC7000;
+                            box-shadow: none;
                             min-width: 48px;
                             min-height: 18px;
                             text-align: center;
@@ -992,7 +1145,7 @@ class FileSanityWidget(QWidget):
                     file_url = QUrl.fromLocalFile(full_path).toString()
                     file_link_label = QLabel()
                     file_link_label.setText(f'<a href="{file_url}" style="color: #0000FF; text-decoration: underline;">{file_name}</a>')
-                    file_link_label.setStyleSheet("background-color: #FFFFFF;")
+                    file_link_label.setStyleSheet("background-color: #E6ECEF;")
                     file_link_label.setOpenExternalLinks(True)
                     file_link_label.setTextInteractionFlags(Qt.TextInteractionFlag.TextBrowserInteraction)
                     self.table.setCellWidget(row, 0, file_link_label)
@@ -1000,9 +1153,9 @@ class FileSanityWidget(QWidget):
                     folder_url = QUrl.fromLocalFile(folder_full_path).toString()
                     folder_link_label = QLabel()
                     folder_link_label.setText(f'<a href="{folder_url}" style="color: #0000FF; text-decoration: underline;">{folder_path}</a>')
-                    folder_link_label.setStyleSheet("background-color: #FFFFFF;")
+                    folder_link_label.setStyleSheet("background-color: #E6ECEF;")
                     folder_link_label.setOpenExternalLinks(True)
-                    file_link_label.setTextInteractionFlags(Qt.TextInteractionFlag.TextBrowserInteraction)
+                    folder_link_label.setTextInteractionFlags(Qt.TextInteractionFlag.TextBrowserInteraction)
                     self.table.setCellWidget(row, 1, folder_link_label)
                     delete_btn = QPushButton("Delete")
                     delete_btn.setFont(QFont("Helvetica", 9))
@@ -1069,7 +1222,7 @@ class FileSanityWidget(QWidget):
                     file_url = QUrl.fromLocalFile(full_path).toString()
                     file_link_label = QLabel()
                     file_link_label.setText(f'<a href="{file_url}" style="color: #0000FF; text-decoration: underline;">{file_name}</a>')
-                    file_link_label.setStyleSheet("background-color: #FFFFFF;")
+                    file_link_label.setStyleSheet("background-color: #E6ECEF;")
                     file_link_label.setOpenExternalLinks(True)
                     file_link_label.setTextInteractionFlags(Qt.TextInteractionFlag.TextBrowserInteraction)
                     self.table.setCellWidget(row, 0, file_link_label)
@@ -1077,7 +1230,7 @@ class FileSanityWidget(QWidget):
                     folder_url = QUrl.fromLocalFile(folder_full_path).toString()
                     folder_link_label = QLabel()
                     folder_link_label.setText(f'<a href="{folder_url}" style="color: #0000FF; text-decoration: underline;">{folder_path}</a>')
-                    folder_link_label.setStyleSheet("background-color: #FFFFFF;")
+                    folder_link_label.setStyleSheet("background-color: #E6ECEF;")
                     folder_link_label.setOpenExternalLinks(True)
                     folder_link_label.setTextInteractionFlags(Qt.TextInteractionFlag.TextBrowserInteraction)
                     self.table.setCellWidget(row, 1, folder_link_label)
@@ -1119,14 +1272,6 @@ class FileSanityWidget(QWidget):
         self.table.resizeColumnsToContents()
         self.table.setColumnWidth(2, max(110, self.table.columnWidth(2)))
 
-    def add_table_row(self, col1: str, col2: str, col3: str):
-        self.logger.debug(f"Adding table row: {col1}, {col2}, {col3}")
-        row = self.table.rowCount()
-        self.table.insertRow(row)
-        self.table.setItem(row, 0, QTableWidgetItem(col1))
-        self.table.setItem(row, 1, QTableWidgetItem(col2))
-        self.table.setItem(row, 2, QTableWidgetItem(col3))
-
     def refresh_delete_directory(self, selected_dir: str):
         self.logger.debug(f"Refreshing delete unnecessary folders with selected_dir: {selected_dir}")
         self.table.setRowCount(0)
@@ -1146,7 +1291,7 @@ class FileSanityWidget(QWidget):
                     folder_url = QUrl.fromLocalFile(full_path).toString()
                     folder_link_label = QLabel()
                     folder_link_label.setText(f'<a href="{folder_url}" style="color: #0000FF; text-decoration: underline;">{folder_name}</a>')
-                    folder_link_label.setStyleSheet("background-color: #FFFFFF;")
+                    folder_link_label.setStyleSheet("background-color: #E6ECEF;")
                     folder_link_label.setOpenExternalLinks(True)
                     folder_link_label.setTextInteractionFlags(Qt.TextInteractionFlag.TextBrowserInteraction)
                     self.table.setCellWidget(row, 0, folder_link_label)

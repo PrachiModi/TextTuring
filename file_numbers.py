@@ -37,7 +37,7 @@ def analyze_files(directory_path):
 
 def get_files_by_type(directory_path, file_type):
     """
-    Get files of a specific type in the directory.
+    Get files of a specific type in the directory, excluding LegacyTextTuring folder.
     
     Args:
         directory_path (str): Directory to search.
@@ -51,6 +51,9 @@ def get_files_by_type(directory_path, file_type):
 
     try:
         for root, _, files in os.walk(directory_path):
+            if 'LegacyTextTuring' in root.split(os.sep):
+                logger.debug(f"Skipping LegacyTextTuring directory: {root}")
+                continue
             for file in files:
                 if file.lower().endswith(file_type):
                     file_name = file
@@ -71,6 +74,7 @@ def get_files_by_type(directory_path, file_type):
 def move_file_to_trash(full_path, directory_path):
     """
     Move a file to the LegacyTextTuring folder within the selected directory.
+    Log the action to LegacyTextTuring/Log.txt with a single header.
     
     Args:
         full_path (str): Full path to the file.
@@ -88,9 +92,29 @@ def move_file_to_trash(full_path, directory_path):
     file_name = os.path.basename(full_path)
     destination = os.path.join(legacy_dir, file_name)
 
+    # Prepare log file
+    log_file = os.path.join(legacy_dir, "Log.txt")
+    log_success = True
+    header_written = os.path.exists(log_file) and os.path.getsize(log_file) > 0
+
     try:
+        # Move the file
         shutil.move(full_path, destination)
         logger.debug(f"Successfully moved {full_path} to {destination}")
+
+        # Log the action
+        rel_path = os.path.relpath(full_path, directory_path).replace(os.sep, "/")
+        try:
+            with open(log_file, 'a', encoding='utf-8') as f:
+                if not header_written:
+                    f.write("-----------------------------\nFile Deletion Log:\n")
+                f.write(f"{rel_path} - Deleted and moved to LegacyTextTuring\n")
+        except (OSError, PermissionError) as e:
+            logger.error(f"Failed to write to log file {log_file}: {str(e)}")
+            log_success = False
+
     except Exception as e:
         logger.error(f"Failed to move {full_path} to {destination}: {str(e)}")
         raise Exception(f"Failed to move file {file_name} to LegacyTextTuring: {str(e)}")
+
+    return log_success

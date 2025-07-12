@@ -1,31 +1,380 @@
 import sys
 import json
 import os
+import signal
+import logging
 from pathlib import Path
 from lxml import etree
 from lxml import html
-import logging
-from datetime import datetime
-import glob
 from urllib.parse import unquote
+import glob
+import asyncio
+import httpx
 import time
-import signal
 
-# Set up logging to console only
+# Set up logging to a file
 logging.basicConfig(
-    level=logging.INFO,
-    format='%(asctime)s - %(levelname)s - %(message)s',
-    handlers=[
-        logging.StreamHandler(sys.stderr)
-    ]
+    level=logging.DEBUG,
+    format='%(asctime)s - %(levelname)s - [%(funcName)s:%(lineno)d] - %(message)s',
+    handlers=[logging.FileHandler('validation.log', mode='w')]
 )
 logger = logging.getLogger(__name__)
+
+CONCURRENT_LIMIT = 50
+TIMEOUT = 10
+URL_CACHE = {}
 
 def timeout_handler(signum, frame):
     raise TimeoutError("File processing timed out")
 
+async def check_link_validity(url, files, client, sem):
+    """Check if an external hyperlink is valid, with retries and GET fallback."""
+    logger.debug(f"Checking URL: {url}")
+    if url in URL_CACHE:
+        logger.debug(f"Using cached result for {url}")
+        return URL_CACHE[url]
+
+    async with sem:
+        headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"}
+        attempts = 0
+        max_attempts = 3
+        while attempts < max_attempts:
+            attempts += 1
+            try:
+                start_time = time.time()
+                response = await client.head(url, follow_redirects=False, timeout=TIMEOUT, headers=headers)
+                duration = time.time() - start_time
+                logger.debug(f"URL={url}, Attempt={attempts}, Method=HEAD, Status={response.status_code}, Duration={duration:.3f}s")
+                
+                if response.status_code in (301, 302):
+                    redirected_url = response.headers.get("Location", "")
+                    result = ({"url": url, "files": files, "reason": f"Redirected, Status: {response.status_code}", "redirected_to": redirected_url}, "redirected")
+                    URL_CACHE[url] = result
+                    return result
+                elif response.status_code >= 400:
+                    result = ({"url": url, "files": files, "reason": f"Status: {response.status_code}"}, "invalid")
+                    URL_CACHE[url] = result
+                    return result
+                else:
+                    result = ({"url": url, "files": files, "reason": f"Valid, Status: {response.status_code}"}, "valid")
+                    URL_CACHE[url] = result
+                    return result
+            
+            except httpx.TimeoutException:
+                if attempts == max_attempts:
+                    logger.debug(f"URL={url}, Attempt={attempts}, Method=HEAD, Timeout after {TIMEOUT}s")
+                    try:
+                        start_time = time.time()
+                        response = await client.get(url, follow_redirects=False, timeout=TIMEOUT, headers=headers)
+                        duration = time.time() - start_time
+                        logger.debug(f"URL={url}, Attempt={attempts}, Method=GET, Status={response.status_code}, Duration={duration:.3f}s")
+                        
+                        if response.status_code in (301, 302):
+                            redirected_url = response.headers.get("Location", "")
+                            result = ({"url": url, "files": files, "reason": f"Redirected, Status: {response.status_code}", "redirected_to": redirected_url}, "redirected")
+                            URL_CACHE[url] = result
+                            return result
+                        elif response.status_code >= 400:
+                            result = ({"url": url, "files": files, "reason": f"Status: {response.status_code}"}, "invalid")
+                            URL_CACHE[url] = result
+                            return result
+                        else:
+                            result = ({"url": url, "files": files, "reason": f"Valid, Status: {response.status_code}"}, "valid")
+                            URL_CACHE[url] = result
+                            return result
+                    except httpx.TimeoutException:
+                        logger.debug(f"URL={url}, Attempt={attempts}, Method=GET, Timeout after {TIMEOUT}s")
+                        result = ({"url": url, "files": files, "reason": f"Timeout after {TIMEOUT}s"}, "unreachable")
+                        URL_CACHE[url] = result
+                        return result
+                    except Exception as e:
+                        logger.debug(f"URL={url}, Attempt={attempts}, Method=GET, Error={str(e)}")
+                        result = ({"url": url, "files": files, "reason": f"Error: {str(e)}"}, "unreachable")
+                        URL_CACHE[url] = result
+                        return result
+            except Exception as e:
+                if attempts == max_attempts:
+                    logger.debug(f"URL={url}, Attempt={attempts}, Method=HEAD, Error={str(e)}")
+                    result = ({"url": url, "files": files, "reason": f"Error: {str(e)}"}, "unreachable")
+                    URL_CACHE[url] = result
+                    return result
+                logger.debug(f"URL={url}, Attempt={attempts}, Method=HEAD, Retrying due to {str(e)}")
+                await asyncio.sleep(1)
+
+async def validate_all_external_links(external_links):
+    """Validate all unique external links concurrently in batches."""
+    logger.info(f"Starting validation of {len(external_links)} unique URLs")
+    invalid_links = []
+    redirected_links = []
+    unreachable_links = []
+    valid_links = []
+    unique_urls = list(external_links.keys())
+    batch_size = 100
+
+    sem = asyncio.Semaphore(CONCURRENT_LIMIT)
+    async with httpx.AsyncClient() as client:
+        for i in range(0, len(unique_urls), batch_size):
+            batch_urls = unique_urls[i:i + batch_size]
+            tasks = []
+            for url in batch_urls:
+                tasks.append(check_link_validity(url, list(set(external_links[url])), client, sem))  # Deduplicate files
+            logger.debug(f"Processing batch {i//batch_size + 1} with {len(batch_urls)} URLs")
+            try:
+                results = await asyncio.gather(*tasks, return_exceptions=True)
+                for result in results:
+                    if isinstance(result, Exception):
+                        logger.error(f"Validation error: {str(result)}")
+                        continue
+                    link_info, category = result
+                    logger.debug(f"URL={link_info['url']}, Category={category}, Reason={link_info['reason']}")
+                    if category == "redirected":
+                        redirected_links.append(link_info)
+                    elif category == "invalid":
+                        invalid_links.append(link_info)
+                    elif category == "unreachable":
+                        unreachable_links.append(link_info)
+                    elif category == "valid":
+                        valid_links.append(link_info)
+            except Exception as e:
+                logger.error(f"Batch validation error: {str(e)}")
+
+    logger.info(f"Validation complete: Valid={len(valid_links)}, Redirected={len(redirected_links)}, Invalid={len(invalid_links)}, Unreachable={len(unreachable_links)}")
+    return {
+        "total_external_links": sum(len(files) for files in external_links.values()),
+        "redirected": redirected_links,
+        "invalid": invalid_links,
+        "unreachable": unreachable_links
+    }
+
+def validate_links_and_images(html_path):
+    """Validate internal links, images, and external links in HTML files."""
+    logger.info(f"Starting validation for {html_path}")
+    total_links = 0
+    total_images = 0
+    total_external_links = 0
+    link_issues = []
+    image_issues = []
+    external_links = {}
+    base_dir = Path(html_path).parent
+    graphics_dir = base_dir / "Graphics"
+    path_cache = {}
+
+    path_mappings = {
+        "Chapter - What's New": "Chapter - Whats New",
+        "Chapter - Whats New": "Chapter - Whats New",
+        "Chapter - What's New in this Guide": "Chapter - Whats New in this Guide",
+        "Chapter - Whats New in this Guide": "Chapter - Whats New in this Guide",
+        "Chapter - What's New in This Guide": "Chapter - Whats New in this Guide"
+    }
+
+    if not graphics_dir.exists():
+        error_msg = f"Graphics folder not found at {graphics_dir}"
+        logger.error(error_msg)
+        return {"error": error_msg}
+
+    html_files = (
+        [str(Path(html_path))] +
+        list(glob.glob(str(base_dir / "**" / "*.html"), recursive=True)) +
+        list(glob.glob(str(base_dir / "**" / "*.HTML"), recursive=True))
+    )
+    html_files = [Path(f) for f in sorted(set(html_files))]
+    total_files = len(html_files)
+    logger.info(f"Found {total_files} HTML files")
+
+    if not html_files:
+        logger.warning("No HTML files found in project directory")
+        return {"error": "No valid HTML files found"}
+
+    for html_file in html_files:
+        file_path = str(html_file)
+        logger.debug(f"Processing HTML file: {html_file.name}")
+
+        try:
+            signal.signal(signal.SIGALRM, timeout_handler)
+            signal.alarm(120)
+
+            parser = etree.HTMLParser(recover=True)
+            with open(html_file, 'rb') as f:
+                tree = html.parse(f, parser=parser)
+
+            # Validate internal links and collect external links
+            links = tree.xpath("//a[@href]")
+            total_links += len(links)
+            logger.debug(f"Found {len(links)} links in {html_file.name}")
+
+            file_added = set()  # Track files added for each URL in this file
+            for link in links:
+                href = link.get("href")
+                if not href:
+                    continue
+                if href.startswith(("http://", "https://")):
+                    href = unquote(href)
+                    file_path_str = str(html_file.relative_to(base_dir))
+                    if (href, file_path_str) not in file_added:  # Only add file once per URL
+                        external_links.setdefault(href, []).append(file_path_str)
+                        file_added.add((href, file_path_str))
+                    continue
+
+                try:
+                    decoded_href = unquote(href.split('#')[0])
+                    mapped_href = decoded_href
+                    for old_path, new_path in path_mappings.items():
+                        if old_path in mapped_href:
+                            mapped_href = mapped_href.replace(old_path, new_path)
+
+                    if mapped_href in path_cache:
+                        target_path = path_cache[mapped_href]
+                    else:
+                        html_dir = html_file.parent
+                        target_path = (html_dir / mapped_href).resolve()
+                        path_cache[mapped_href] = target_path
+
+                    if not str(target_path).startswith(str(base_dir)):
+                        link_issues.append({
+                            "file": html_file.name,
+                            "href": href,
+                            "location": str(html_file.relative_to(base_dir)),
+                            "issue": "Link points outside project directory"
+                        })
+                        continue
+
+                    if not target_path.exists():
+                        parent_dir = target_path.parent
+                        target_name = target_path.name
+                        for existing_file in parent_dir.glob("*"):
+                            if existing_file.name.lower() == target_name.lower():
+                                target_path = existing_file
+                                path_cache[mapped_href] = target_path
+                                break
+                        if not target_path.exists():
+                            link_issues.append({
+                                "file": html_file.name,
+                                "href": href,
+                                "location": str(html_file.relative_to(base_dir)),
+                                "issue": f"Target file does not exist: {target_path}"
+                            })
+
+                except (ValueError, OSError) as e:
+                    link_issues.append({
+                        "file": html_file.name,
+                        "href": href,
+                        "location": str(html_file.relative_to(base_dir)),
+                        "issue": f"Invalid path in href: {str(e)}"
+                    })
+
+            # Validate images
+            images = tree.xpath("//img[@src]")
+            total_images += len(images)
+            logger.debug(f"Found {len(images)} images in {html_file.name}")
+
+            for img in images:
+                src = img.get("src")
+                if not src:
+                    continue
+
+                try:
+                    decoded_href = unquote(src)
+                    if decoded_href in path_cache:
+                        target_path = path_cache[decoded_href]
+                    else:
+                        html_dir = html_file.parent
+                        target_path = (html_dir / decoded_href).resolve()
+                        path_cache[decoded_href] = target_path
+
+                    if not str(target_path).startswith(str(graphics_dir)):
+                        image_issues.append({
+                            "file": html_file.name,
+                            "src": src,
+                            "location": str(html_file.relative_to(base_dir)),
+                            "issue": f"Image points outside Graphics folder: {target_path}"
+                        })
+                        continue
+
+                    if not target_path.exists():
+                        image_issues.append({
+                            "file": html_file.name,
+                            "src": src,
+                            "location": str(html_file.relative_to(base_dir)),
+                            "issue": f"Image file does not exist: {target_path}"
+                        })
+
+                except (ValueError, OSError) as e:
+                    image_issues.append({
+                        "file": html_file.name,
+                        "src": src,
+                        "location": str(html_file.relative_to(base_dir)),
+                        "issue": f"Invalid path in src: {str(e)}"
+                    })
+
+            signal.alarm(0)
+
+        except TimeoutError:
+            logger.error(f"Timeout processing {html_file.name}")
+            link_issues.append({
+                "file": html_file.name,
+                "href": "N/A",
+                "location": str(html_file.relative_to(base_dir)),
+                "issue": "File processing timed out"
+            })
+            image_issues.append({
+                "file": html_file.name,
+                "src": "N/A",
+                "location": str(html_file.relative_to(base_dir)),
+                "issue": "File processing timed out"
+            })
+            signal.alarm(0)
+
+        except html.HtmlParsingError as e:
+            logger.error(f"Error parsing {html_file.name}: {str(e)}")
+            link_issues.append({
+                "file": html_file.name,
+                "href": "N/A",
+                "location": str(html_file.relative_to(base_dir)),
+                "issue": f"Error parsing HTML: {str(e)}"
+            })
+            image_issues.append({
+                "file": html_file.name,
+                "src": "N/A",
+                "location": str(html_file.relative_to(base_dir)),
+                "issue": f"Error parsing HTML: {str(e)}"
+            })
+
+        except Exception as e:
+            logger.error(f"Unexpected error processing {html_file.name}: {str(e)}")
+            link_issues.append({
+                "file": html_file.name,
+                "href": "N/A",
+                "location": str(html_file.relative_to(base_dir)),
+                "issue": f"Unexpected error: {str(e)}"
+            })
+            image_issues.append({
+                "file": html_file.name,
+                "src": "N/A",
+                "location": str(html_file.relative_to(base_dir)),
+                "issue": f"Unexpected error: {str(e)}"
+            })
+
+    # Validate external links
+    external_result = {}
+    if external_links:
+        try:
+            external_result = asyncio.run(validate_all_external_links(external_links))
+            total_external_links = external_result.get("total_external_links", 0)
+        except Exception as e:
+            logger.error(f"External link validation failed: {str(e)}")
+            external_result = {"error": f"External link validation failed: {str(e)}"}
+
+    logger.info(f"Validation complete: {total_links} internal links, {total_images} images, {total_external_links} external links, {len(link_issues)} link issues, {len(image_issues)} image issues")
+    return {
+        "total_internal_links": total_links,
+        "total_images": total_images,
+        "link_issues": link_issues,
+        "image_issues": image_issues,
+        "external_links": external_result
+    }
+
 def validate_internal_links(html_path, validate_html=True):
-    """Validate internal links in HTML or XML files within the project directory."""
+    """Validate internal links in HTML or XML/DITA files (unchanged)."""
     logger.info(f"Starting internal links validation for {html_path}, validate_html={validate_html}")
     total_links = 0
     link_issues = []
@@ -33,7 +382,6 @@ def validate_internal_links(html_path, validate_html=True):
     topics_dir = base_dir / "Topics"
     path_cache = {}
 
-    # Updated path mappings to preserve actual folder names
     path_mappings = {
         "Chapter - What's New": "Chapter - Whats New",
         "Chapter - Whats New": "Chapter - Whats New",
@@ -45,31 +393,25 @@ def validate_internal_links(html_path, validate_html=True):
     if validate_html:
         logger.info(f"Looking for HTML files in {base_dir}")
         html_files = (
-            [Path(html_path)] +
+            [str(Path(html_path))] +
             list(glob.glob(str(base_dir / "**" / "*.html"), recursive=True)) +
             list(glob.glob(str(base_dir / "**" / "*.HTML"), recursive=True))
         )
-        html_files = [Path(f) for f in set(html_files)]
+        html_files = [Path(f) for f in sorted(set(html_files))]
         total_files = len(html_files)
         logger.info(f"Found {total_files} HTML files")
-        print(json.dumps({"progress": f"Found {total_files} HTML files in project directory"}, ensure_ascii=False), file=sys.stderr)
-        sys.stdout.flush()
 
         if not html_files:
             logger.warning("No HTML files found in project directory")
-            print(json.dumps({"progress": "No HTML files found in project directory"}, ensure_ascii=False), file=sys.stderr)
-            sys.stdout.flush()
 
-        for idx, html_file in enumerate(html_files, 1):
+        for html_file in html_files:
             file_path = str(html_file)
             folder_name = html_file.parent.name
-            logger.info(f"Processing HTML file {idx}/{total_files}: {html_file.name}")
-            print(json.dumps({"progress": f"Processing HTML file {idx}/{total_files}: {file_path}"}, ensure_ascii=False), file=sys.stderr)
-            sys.stdout.flush()
+            logger.info(f"Processing HTML file: {html_file.name}")
 
             try:
                 signal.signal(signal.SIGALRM, timeout_handler)
-                signal.alarm(10)
+                signal.alarm(50)
 
                 parser = etree.HTMLParser(recover=True)
                 with open(html_file, 'rb') as f:
@@ -86,7 +428,6 @@ def validate_internal_links(html_path, validate_html=True):
                     try:
                         decoded_href = unquote(href.split('#')[0])
                         mapped_href = decoded_href
-                        # Apply path mappings
                         for old_path, new_path in path_mappings.items():
                             if old_path in mapped_href:
                                 mapped_href = mapped_href.replace(old_path, new_path)
@@ -108,7 +449,6 @@ def validate_internal_links(html_path, validate_html=True):
                             continue
 
                         if not target_path.exists():
-                            # Check for case-insensitive file existence
                             parent_dir = target_path.parent
                             target_name = target_path.name
                             for existing_file in parent_dir.glob("*"):
@@ -133,8 +473,6 @@ def validate_internal_links(html_path, validate_html=True):
                         })
 
                 signal.alarm(0)
-                print(json.dumps({"progress": f"Completed processing {file_path}"}, ensure_ascii=False), file=sys.stderr)
-                sys.stdout.flush()
 
             except TimeoutError:
                 logger.error(f"Timeout processing {html_file.name}")
@@ -172,32 +510,26 @@ def validate_internal_links(html_path, validate_html=True):
             list(glob.glob(str(base_dir / "*.ditamap"), recursive=False)) +
             list(glob.glob(str(base_dir / "*.DITAMAP"), recursive=False))
         )
-        xml_files = [Path(f) for f in xml_files]
+        xml_files = [Path(f) for f in sorted(set(xml_files))]
         total_files = len(xml_files)
         logger.info(f"Found {total_files} XML/DITA files")
-        print(json.dumps({"progress": f"Found {total_files} XML/DITA files in Topics folder"}, ensure_ascii=False), file=sys.stderr)
-        sys.stdout.flush()
 
         if not xml_files:
             logger.warning("No XML or DITA files found in Topics folder or project root")
-            print(json.dumps({"progress": "No XML or DITA files found in Topics folder or project root"}, ensure_ascii=False), file=sys.stderr)
-            sys.stdout.flush()
 
         namespaces = {
             'dita': 'http://dita.oasis-open.org/architecture/2005/',
             '': None
         }
 
-        for idx, xml_path in enumerate(xml_files, 1):
+        for xml_path in xml_files:
             file_path = str(xml_path)
             folder_name = xml_path.parent.name
-            logger.info(f"Processing file {idx}/{total_files}: {xml_path.name}")
-            print(json.dumps({"progress": f"Processing file {idx}/{total_files}: {file_path}"}, ensure_ascii=False), file=sys.stderr)
-            sys.stdout.flush()
+            logger.info(f"Processing file: {xml_path.name}")
 
             try:
                 signal.signal(signal.SIGALRM, timeout_handler)
-                signal.alarm(10)
+                signal.alarm(50)
 
                 parser = etree.XMLParser(recover=True)
                 tree = etree.parse(str(xml_path), parser)
@@ -261,8 +593,6 @@ def validate_internal_links(html_path, validate_html=True):
                         })
 
                 signal.alarm(0)
-                print(json.dumps({"progress": f"Completed processing {file_path}"}, ensure_ascii=False), file=sys.stderr)
-                sys.stdout.flush()
 
             except TimeoutError:
                 logger.error(f"Timeout processing {xml_path.name}")
@@ -291,22 +621,13 @@ def validate_internal_links(html_path, validate_html=True):
                 })
 
     logger.info(f"Validation complete: {total_links} links found, {len(link_issues)} issues")
-    print(json.dumps({"progress": f"Completed validation: {total_links} links found, {len(link_issues)} issues"}, ensure_ascii=False), file=sys.stderr)
-    sys.stdout.flush()
-
-    # Print incorrect links to console
-    if link_issues:
-        print("Incorrect Links:", file=sys.stderr)
-        for issue in link_issues:
-            print(f"File: {issue['file']}, Href: {issue['href']}, Location: {issue['location']}, Issue: {issue['issue']}", file=sys.stderr)
-
     return {
         "total_internal_links": total_links,
         "link_issues": link_issues
     }
 
 def validate_images(html_path):
-    """Validate images in HTML files within the project directory."""
+    """Validate images in HTML files (unchanged)."""
     logger.info(f"Starting image validation for {html_path}")
     total_images = 0
     image_issues = []
@@ -317,37 +638,28 @@ def validate_images(html_path):
     if not graphics_dir.exists():
         error_msg = f"Graphics folder not found at {graphics_dir}"
         logger.error(error_msg)
-        print(json.dumps({"error": error_msg}, ensure_ascii=False), file=sys.stderr)
-        sys.stdout.flush()
         return {"error": error_msg}
 
-    # Find all HTML files
     html_files = (
-        [Path(html_path)] +
+        [str(Path(html_path))] +
         list(glob.glob(str(base_dir / "**" / "*.html"), recursive=True)) +
         list(glob.glob(str(base_dir / "**" / "*.HTML"), recursive=True))
     )
-    html_files = [Path(f) for f in set(html_files)]
+    html_files = [Path(f) for f in sorted(set(html_files))]
     total_files = len(html_files)
     logger.info(f"Found {total_files} HTML files")
-    print(json.dumps({"progress": f"Found {total_files} HTML files in project directory"}, ensure_ascii=False), file=sys.stderr)
-    sys.stdout.flush()
 
     if not html_files:
         logger.warning("No HTML files found in project directory")
-        print(json.dumps({"progress": "No HTML files found in project directory"}, ensure_ascii=False), file=sys.stderr)
-        sys.stdout.flush()
 
-    for idx, html_file in enumerate(html_files, 1):
+    for html_file in html_files:
         file_path = str(html_file)
         folder_name = html_file.parent.name
-        logger.info(f"Processing HTML file {idx}/{total_files}: {html_file.name}")
-        print(json.dumps({"progress": f"Processing HTML file {idx}/{total_files}: {file_path}"}, ensure_ascii=False), file=sys.stderr)
-        sys.stdout.flush()
+        logger.info(f"Processing HTML file: {html_file.name}")
 
         try:
             signal.signal(signal.SIGALRM, timeout_handler)
-            signal.alarm(10)
+            signal.alarm(50)
 
             parser = etree.HTMLParser(recover=True)
             with open(html_file, 'rb') as f:
@@ -355,8 +667,6 @@ def validate_images(html_path):
             images = tree.xpath("//img[@src]")
             total_images += len(images)
             logger.info(f"Found {len(images)} images in {html_file.name}")
-            print(json.dumps({"progress": f"Found {len(images)} images in {html_file.name}"}, ensure_ascii=False), file=sys.stderr)
-            sys.stdout.flush()
 
             for img in images:
                 src = img.get("src")
@@ -388,6 +698,7 @@ def validate_images(html_path):
                             "location": str(html_file.relative_to(base_dir)),
                             "issue": f"Image file does not exist: {target_path}"
                         })
+
                 except (ValueError, OSError) as e:
                     image_issues.append({
                         "file": html_file.name,
@@ -397,8 +708,6 @@ def validate_images(html_path):
                     })
 
             signal.alarm(0)
-            print(json.dumps({"progress": f"Completed processing {file_path}"}, ensure_ascii=False), file=sys.stderr)
-            sys.stdout.flush()
 
         except TimeoutError:
             logger.error(f"Timeout processing {html_file.name}")
@@ -427,8 +736,6 @@ def validate_images(html_path):
             })
 
     logger.info(f"Image validation complete: {total_images} images found, {len(image_issues)} issues")
-    print(json.dumps({"progress": f"Completed image validation: {total_images} images found, {len(image_issues)} issues"}, ensure_ascii=False), file=sys.stderr)
-    sys.stdout.flush()
     return {
         "total_images": total_images,
         "image_issues": image_issues
@@ -444,7 +751,9 @@ def main(html_path, mode):
         sys.stdout.flush()
         sys.exit(1)
 
-    if mode == "internal_links":
+    if mode == "links_and_images":
+        result = validate_links_and_images(html_path)
+    elif mode == "internal_links":
         result = validate_internal_links(html_path, validate_html=True)
     elif mode == "images":
         result = validate_images(html_path)

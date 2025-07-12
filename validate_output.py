@@ -1,189 +1,126 @@
 from PyQt6.QtWidgets import QWidget, QVBoxLayout, QHBoxLayout, QPushButton, QLabel, QFileDialog, QTableWidget, QTableWidgetItem, QHeaderView, QApplication
 from PyQt6.QtCore import Qt, QThread, pyqtSignal, QUrl
-from PyQt6.QtGui import QFont, QPalette, QColor, QDesktopServices
+from PyQt6.QtGui import QFont, QPalette, QColor, QDesktopServices, QPixmap
 import PyPDF2
 import os
 import subprocess
 import json
-import time
-import logging
-from datetime import datetime
-
-# Set up logging
-logging.basicConfig(
-    level=logging.DEBUG,
-    format='%(asctime)s - %(levelname)s - %(message)s',
-    handlers=[logging.StreamHandler()]
-)
-logger = logging.getLogger(__name__)
+from pathlib import Path
+from markdown_viewer import MarkdownViewer
 
 class TableCheckThread(QThread):
-    progress = pyqtSignal(str)
-    update_progress_value = pyqtSignal(int)
     result = pyqtSignal(list)
 
     def __init__(self, pdf_path):
         super().__init__()
         self.pdf_path = pdf_path
         self.is_canceled = False
-        self.total_pages = 0
-        self.current_page = 0
+        self.process = None
 
     def run(self):
-        logger.info(f"Starting TableCheckThread for {self.pdf_path}")
         overflow_pages = []
         try:
-            process = subprocess.Popen(
+            self.process = subprocess.Popen(
                 ["python3", "verify_pdf_tables.py", self.pdf_path],
                 stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE,
                 text=True,
-                bufsize=1,
+                bufsize=50,
                 universal_newlines=True
             )
-            while process.poll() is None:
-                line = process.stdout.readline().strip()
-                logger.debug(f"Raw stdout line: {line}")
-                if line:
-                    try:
-                        data = json.loads(line)
-                        if "progress" in data:
-                            self.progress.emit(data["progress"])
-                            if "Found" in data["progress"] and "pages" in data["progress"]:
-                                try:
-                                    self.total_pages = int(data["progress"].split()[1])
-                                    logger.info(f"Total pages: {self.total_pages}")
-                                except (IndexError, ValueError):
-                                    logger.warning("Could not parse total pages")
-                            elif "Processing page" in data["progress"]:
-                                self.current_page += 1
-                                if self.total_pages > 0:
-                                    progress = int((self.current_page / self.total_pages) * 100)
-                                    self.update_progress_value.emit(progress)
-                                    logger.debug(f"Progress: {progress}%")
-                        elif "result" in data:
-                            overflow_pages = data["result"]
-                            logger.info("Received result")
-                    except json.JSONDecodeError as e:
-                        logger.error(f"JSON decode error: {e} on line: {line}")
-                        continue
-                if process.poll() is None and self.wait(120000):
-                    logger.error("Subprocess timed out after 120 seconds")
-                    process.terminate()
-                    overflow_pages = ["Error: Validation timed out after 120 seconds"]
-                    break
-            stdout_remainder = process.stdout.read()
-            for line in stdout_remainder.splitlines():
+            stdout, stderr = self.process.communicate()
+            for line in stdout.splitlines():
                 line = line.strip()
-                if line:
+                if line and not self.is_canceled:
                     try:
                         data = json.loads(line)
                         if "result" in data:
                             overflow_pages = data["result"]
-                            logger.info("Received final result")
+                        elif "error" in data:
+                            overflow_pages = [f"Error: {data['error']}"]
                     except json.JSONDecodeError:
-                        logger.error(f"JSON decode error on remaining line: {line}")
-            stderr_output = process.stderr.read()
-            if stderr_output:
-                logger.warning(f"Stderr output: {stderr_output}")
-                if process.returncode != 0 or not overflow_pages:
-                    overflow_pages = [f"Error: {stderr_output}"]
+                        pass
+            if stderr and not self.is_canceled:
+                if not overflow_pages:
+                    overflow_pages = [f"Error: {stderr}"]
+            if not overflow_pages and not self.is_canceled:
+                overflow_pages = []
+        except subprocess.TimeoutExpired:
+            if self.process:
+                self.process.terminate()
+            overflow_pages = ["Error: Validation timed out"]
         except Exception as e:
-            logger.error(f"Thread exception: {str(e)}")
             overflow_pages = [f"Error calling verify_pdf_tables.py: {str(e)}"]
         if not self.is_canceled:
             self.result.emit(overflow_pages)
-            logger.info("TableCheckThread finished")
 
     def cancel(self):
         self.is_canceled = True
+        if self.process and self.process.poll() is None:
+            self.process.terminate()
+            try:
+                self.process.wait(timeout=1)
+            except subprocess.TimeoutExpired:
+                self.process.kill()
         self.terminate()
+        self.wait()
 
 class LinkCheckThread(QThread):
-    progress = pyqtSignal(str)
-    update_progress_value = pyqtSignal(int)
     result = pyqtSignal(dict)
 
     def __init__(self, pdf_path):
         super().__init__()
         self.pdf_path = pdf_path
         self.is_canceled = False
-        self.total_links = 0
-        self.current_link = 0
+        self.process = None
 
     def run(self):
-        logger.info(f"Starting LinkCheckThread for {self.pdf_path}")
         link_report = {}
         try:
-            process = subprocess.Popen(
-                ["python3", "verify_external_pdf_links.py", self.pdf_path],
+            self.process = subprocess.Popen(
+                ["python3", "validate_external_pdf_links.py", self.pdf_path],
                 stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE,
                 text=True,
-                bufsize=1,
+                bufsize=50,
                 universal_newlines=True
             )
-            while process.poll() is None:
-                line = process.stdout.readline().strip()
-                logger.debug(f"Raw stdout line: {line}")
-                if line:
-                    try:
-                        data = json.loads(line)
-                        if "progress" in data:
-                            self.progress.emit(data["progress"])
-                            if "Found" in data["progress"] and "links" in data["progress"]:
-                                try:
-                                    self.total_links = int(data["progress"].split()[1])
-                                    logger.info(f"Total links: {self.total_links}")
-                                except (IndexError, ValueError):
-                                    logger.warning("Could not parse total links")
-                            elif "Checking link" in data["progress"]:
-                                self.current_link += 1
-                                if self.total_links > 0:
-                                    progress = int((self.current_link / self.total_links) * 100)
-                                    self.update_progress_value.emit(progress)
-                                    logger.debug(f"Progress: {progress}%")
-                        elif "result" in data:
-                            link_report = data["result"]
-                            logger.info("Received result")
-                    except json.JSONDecodeError as e:
-                        logger.error(f"JSON decode error: {e} on line: {line}")
-                        continue
-                if process.poll() is None and self.wait(120000):
-                    logger.error("Subprocess timed out after 120 seconds")
-                    process.terminate()
-                    link_report = {"error": "Validation timed out after 120 seconds"}
-                    break
-            stdout_remainder = process.stdout.read()
-            for line in stdout_remainder.splitlines():
+            stdout, stderr = self.process.communicate()
+            for line in stdout.splitlines():
                 line = line.strip()
-                if line:
+                if line and not self.is_canceled:
                     try:
                         data = json.loads(line)
-                        if "result" in data:
-                            link_report = data["result"]
-                            logger.info("Received final result")
+                        if "result" in data or "error" in data:
+                            link_report = data
                     except json.JSONDecodeError:
-                        logger.error(f"JSON decode error on remaining line: {line}")
-            stderr_output = process.stderr.read()
-            if stderr_output:
-                logger.warning(f"Stderr output: {stderr_output}")
+                        pass
+            if stderr and not self.is_canceled:
                 if not link_report:
-                    link_report = {"error": f"Error: {stderr_output}"}
+                    link_report = {"error": f"Subprocess error: {stderr}"}
+            if not link_report and not self.is_canceled:
+                link_report = {"error": "No valid JSON response received"}
+        except subprocess.TimeoutExpired:
+            if self.process:
+                self.process.terminate()
+            link_report = {"error": "Validation timed out"}
         except Exception as e:
-            logger.error(f"Thread exception: {str(e)}")
-            link_report = {"error": f"Error calling verify_external_pdf_links.py: {str(e)}"}
+            link_report = {"error": f"Error calling validate_external_pdf_links.py: {str(e)}"}
         if not self.is_canceled:
             self.result.emit(link_report)
-            logger.info("LinkCheckThread completed")
 
     def cancel(self):
         self.is_canceled = True
+        if self.process and self.process.poll() is None:
+            self.process.terminate()
+            try:
+                self.process.wait(timeout=1)
+            except subprocess.TimeoutExpired:
+                self.process.kill()
         self.terminate()
+        self.wait()
 
 class HTMLValidationThread(QThread):
-    progress = pyqtSignal(str)
-    folder_status = pyqtSignal(str, str)
     result = pyqtSignal(dict)
 
     def __init__(self, html_path, mode):
@@ -193,138 +130,80 @@ class HTMLValidationThread(QThread):
         self.is_canceled = False
 
     def run(self):
-        logger.info(f"Starting HTMLValidationThread for {self.html_path}, mode={self.mode}")
         html_report = {}
         try:
+            script_path = os.path.abspath("verify_html_content.py")
+            if not os.path.exists(script_path):
+                raise FileNotFoundError(f"verify_html_content.py not found at {script_path}")
             process = subprocess.Popen(
-                ["python3", "verify_html_content.py", self.html_path, self.mode],
+                ["python3", script_path, self.html_path, self.mode],
                 stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE,
                 text=True,
-                bufsize=1,
+                bufsize=50,
                 universal_newlines=True
             )
-            while process.poll() is None:
-                line = process.stdout.readline().strip()
-                logger.debug(f"Raw stdout line: {line}")
-                if line:
-                    try:
-                        data = json.loads(line)
-                        if "progress" in data:
-                            self.progress.emit(data["progress"])
-                            if "Processing HTML file" in data["progress"]:
-                                try:
-                                    file_path = data["progress"].split(": ")[1]
-                                    folder_name = os.path.dirname(file_path).split(os.sep)[-1]
-                                    self.folder_status.emit(folder_name, "Processing")
-                                except (IndexError, ValueError):
-                                    logger.warning("Could not parse folder name from progress")
-                            elif "Completed processing" in data["progress"]:
-                                try:
-                                    file_path = data["progress"].split(": ")[1]
-                                    folder_name = os.path.dirname(file_path).split(os.sep)[-1]
-                                    self.folder_status.emit(folder_name, "Done")
-                                except (IndexError, ValueError):
-                                    logger.warning("Could not parse folder name for completion")
-                        elif "result" in data:
-                            html_report = data["result"]
-                            logger.info("Received result")
-                        elif "error" in data:
-                            html_report = {"error": data["error"]}
-                            logger.error(f"Error from script: {data['error']}")
-                    except json.JSONDecodeError as e:
-                        logger.error(f"JSON decode error: {e} on line: {line}")
-                        continue
-                if process.poll() is None and self.wait(120000):
-                    logger.error("Subprocess timed out after 120 seconds")
-                    process.terminate()
-                    html_report = {"error": "Validation timed out after 120 seconds"}
-                    break
-            stdout_remainder = process.stdout.read()
-            for line in stdout_remainder.splitlines():
+            stdout, stderr = process.communicate(timeout=1200)
+            for line in stdout.splitlines():
                 line = line.strip()
                 if line:
                     try:
                         data = json.loads(line)
                         if "result" in data:
                             html_report = data["result"]
-                            logger.info("Received final result")
                         elif "error" in data:
                             html_report = {"error": data["error"]}
-                            logger.error(f"Error from script: {data['error']}")
                     except json.JSONDecodeError:
-                        logger.error(f"JSON decode error on remaining line: {line}")
-            stderr_output = process.stderr.read()
-            if stderr_output:
-                logger.warning(f"Stderr output from verify_html_content.py: {stderr_output}")
+                        pass
+            if stderr:
                 if not html_report:
-                    html_report = {"error": f"Script error: {stderr_output}"}
+                    html_report = {"error": f"Subprocess error: {stderr}"}
             if not html_report:
                 html_report = {"error": "No valid response received from verify_html_content.py"}
-                logger.error("No valid response received")
+        except subprocess.TimeoutExpired:
+            process.destroy()
+            html_report = {"error": "Validation timed out after 1200 seconds"}
         except Exception as e:
-            logger.error(f"Thread exception: {str(e)}")
             html_report = {"error": f"Thread exception: {str(e)}"}
         if not self.is_canceled:
             self.result.emit(html_report)
-            logger.info("HTMLValidationThread finished")
 
     def cancel(self):
         self.is_canceled = True
         self.terminate()
+        self.wait()
 
 class ValidateOutputWidget(QWidget):
     def __init__(self, parent=None):
         super().__init__(parent)
-        self.parent_window = parent  # Reference to main window
-        self.logger = logging.getLogger(__name__)
-        self.logger.debug("Initializing ValidateOutputWidget")
+        self.parent_window = parent
         self.pdf_path = None
         self.html_path = None
-        self.last_progress_update = 0
+        self.validation_report = None
+        self.button_info_labels = {}
+        self.markdown_viewers = []
 
-        # Set dark frame background
         self.setAutoFillBackground(True)
         palette = self.palette()
         palette.setColor(QPalette.ColorRole.Base, QColor("#1F252A"))
         self.setPalette(palette)
 
-        # Main layout
-        layout = QVBoxLayout()
-        layout.setContentsMargins(15, 15, 15, 15)
-        layout.setSpacing(10)
-        self.setLayout(layout)
+        self.layout = QVBoxLayout()
+        self.layout.setContentsMargins(15, 15, 15, 15)
+        self.layout.setSpacing(5)
+        self.setLayout(self.layout)
 
-        # Top button panel
-        button_panel = QHBoxLayout()
-        button_panel.setSpacing(8)
-        button_panel.setContentsMargins(0, 0, 0, 5)
-
-        self.validate_pdf_btn = QPushButton("Validate PDF")
-        self.validate_html_btn = QPushButton("Validate HTML")
-        for btn in [self.validate_pdf_btn, self.validate_html_btn]:
-            btn.setFont(QFont("Helvetica", 12, QFont.Weight.Medium))
-            btn.setMinimumSize(150, 30)
-            button_panel.addWidget(btn)
-        layout.addLayout(button_panel)
-
-        # Middle content area
-        self.content_widget = QWidget()
-        self.content_widget.setStyleSheet("background-color: #E6ECEF; border-radius: 4px;")
         self.content_layout = QVBoxLayout()
-        self.content_layout.setContentsMargins(5, 5, 5, 5)
-        self.content_layout.setSpacing(0)
-        self.content_widget.setLayout(self.content_layout)
+        self.content_layout.setSpacing(5)
+        self.content_layout.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.layout.addLayout(self.content_layout, stretch=1)
 
-        # Feedback label
-        self.feedback_label = QLabel("Select a check to begin")
+        self.feedback_label = QLabel("Select a check to continue")
         self.feedback_label.setFont(QFont("Helvetica", 12))
-        self.feedback_label.setStyleSheet("color: #121416; background-color: transparent;")
+        self.feedback_label.setStyleSheet("color: #FFFFFF; background-color: transparent;")
         self.feedback_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        self.content_layout.addWidget(self.feedback_label, stretch=1)
-        layout.addWidget(self.content_widget, stretch=1)
+        self.content_layout.addWidget(self.feedback_label, stretch=0)
 
-        # Table (initially hidden)
         self.table = QTableWidget()
         self.table.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
         self.table.setFont(QFont("Helvetica", 10))
@@ -333,39 +212,104 @@ class ValidateOutputWidget(QWidget):
         header = self.table.horizontalHeader()
         header.setSectionResizeMode(QHeaderView.ResizeMode.Stretch)
         self.table.verticalHeader().setDefaultSectionSize(30)
+        self.table.setWordWrap(True)
+        self.table.setSortingEnabled(False)
+        self.content_layout.addWidget(self.table, stretch=0)
 
-        # Bottom button panel
-        bottom_panel = QHBoxLayout()
-        bottom_panel.setSpacing(8)
-        bottom_panel.setContentsMargins(0, 5, 0, 0)
+        self.external_table = QTableWidget()
+        self.external_table.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
+        self.external_table.setFont(QFont("Helvetica", 10))
+        self.external_table.setAlternatingRowColors(True)
+        self.external_table.setVisible(False)
+        external_header = self.external_table.horizontalHeader()
+        external_header.setSectionResizeMode(QHeaderView.ResizeMode.Stretch)
+        self.external_table.verticalHeader().setDefaultSectionSize(30)
+        self.external_table.setWordWrap(True)
+        self.external_table.setSortingEnabled(False)
+        self.content_layout.addWidget(self.external_table, stretch=0)
 
+        button_panel = QHBoxLayout()
+        button_panel.setSpacing(8)
+        button_panel.setContentsMargins(0, 0, 0, 5)
+
+        pdf_layout = QVBoxLayout()
+        pdf_icon_container = QWidget()
+        pdf_icon_container.setFixedHeight(40)
+        pdf_icon_layout = QHBoxLayout()
+        pdf_icon_container.setLayout(pdf_icon_layout)
+        pdf_icon_container.setStyleSheet("background-color: transparent;")
+
+        pdf_info_label = QLabel()
+        pdf_info_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        icon_path = os.path.join(os.path.dirname(__file__), "icon.png")
+        if os.path.exists(icon_path):
+            pixmap = QPixmap(icon_path).scaled(16, 16, Qt.AspectRatioMode.KeepAspectRatio)
+            pdf_info_label.setPixmap(pixmap)
+        else:
+            pixmap = QPixmap(16, 16)
+            pixmap.fill(Qt.GlobalColor.transparent)
+            pdf_info_label.setPixmap(pixmap)
+        pdf_info_label.setStyleSheet("background-color: transparent; border: none;")
+        pdf_info_label.setCursor(Qt.CursorShape.PointingHandCursor)
+        pdf_info_label.setVisible(False)
+        pdf_info_label.mousePressEvent = lambda event: self.open_markdown_help("Validate PDF")
+        self.button_info_labels["Validate PDF"] = pdf_info_label
+        pdf_icon_layout.addWidget(pdf_info_label)
+
+        self.validate_pdf_btn = QPushButton("Validate PDF")
+        self.validate_pdf_btn.setFont(QFont("Helvetica", 12, QFont.Weight.Medium))
+        self.validate_pdf_btn.setMinimumSize(150, 30)
+        self.validate_pdf_btn.setStyleSheet("background-color: #0D6E6E; color: #FFFFFF; padding: 5px 10px; border-radius: 4px; border: 1px solid #0A5555;")
+        pdf_layout.addWidget(pdf_icon_container)
+        pdf_layout.addWidget(self.validate_pdf_btn)
+        button_panel.addLayout(pdf_layout)
+
+        html_layout = QVBoxLayout()
+        html_icon_container = QWidget()
+        html_icon_container.setFixedHeight(40)
+        html_icon_layout = QHBoxLayout()
+        html_icon_container.setLayout(html_icon_layout)
+        html_icon_container.setStyleSheet("background-color: transparent;")
+
+        html_info_label = QLabel()
+        html_info_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        if os.path.exists(icon_path):
+            pixmap = QPixmap(icon_path).scaled(16, 16, Qt.AspectRatioMode.KeepAspectRatio)
+            html_info_label.setPixmap(pixmap)
+        else:
+            pixmap = QPixmap(16, 16)
+            pixmap.fill(Qt.GlobalColor.transparent)
+            html_info_label.setPixmap(pixmap)
+        html_info_label.setStyleSheet("background-color: transparent; border: none;")
+        html_info_label.setCursor(Qt.CursorShape.PointingHandCursor)
+        html_info_label.setVisible(False)
+        html_info_label.mousePressEvent = lambda event: self.open_markdown_help("Validate HTML")
+        self.button_info_labels["Validate HTML"] = html_info_label
+        html_icon_layout.addWidget(html_info_label)
+
+        self.validate_html_btn = QPushButton("Validate HTML")
+        self.validate_html_btn.setFont(QFont("Helvetica", 12, QFont.Weight.Medium))
+        self.validate_html_btn.setMinimumSize(150, 30)
+        self.validate_html_btn.setStyleSheet("background-color: #0D6E6E; color: #FFFFFF; padding: 5px 10px; border-radius: 4px; border: 1px solid #0A5555;")
+        html_layout.addWidget(html_icon_container)
+        html_layout.addWidget(self.validate_html_btn)
+        button_panel.addLayout(html_layout)
+
+        self.layout.addLayout(button_panel, stretch=0)
+
+        self.bottom_panel = QHBoxLayout()
+        self.bottom_panel.setSpacing(8)
+        self.bottom_panel.setContentsMargins(0, 5, 0, 0)
         self.back_btn = QPushButton("Back")
         self.back_btn.setFont(QFont("Helvetica", 12, QFont.Weight.Medium))
-        self.back_btn.setMinimumHeight(30)
-        bottom_panel.addWidget(self.back_btn)
-        layout.addLayout(bottom_panel)
+        self.back_btn.setMinimumSize(150, 30)
+        self.back_btn.setStyleSheet("background-color: #0D6E6E; color: #FFFFFF; padding: 5px 10px; border-radius: 4px; border: 1px solid #0A5555;")
+        self.bottom_panel.addWidget(self.back_btn)
+        self.layout.addLayout(self.bottom_panel, stretch=0)
 
-        # Apply styling
         self.setStyleSheet("""
-            QWidget {
+            ValidateOutputWidget, QWidget {
                 background-color: #1F252A;
-            }
-            QPushButton {
-                background-color: #0D6E6E;
-                color: #FFFFFF;
-                padding: 5px 15px;
-                border-radius: 4px;
-                border: 1px solid #0A5555;
-                min-height: 20px;
-            }
-            QPushButton:hover {
-                background-color: #139999;
-                border: 1px solid #0C7A7A;
-            }
-            QPushButton:disabled {
-                background-color: #4A6A6A;
-                color: #A0A0A0;
-                border: 1px solid #3A4A4A;
             }
             QTableWidget {
                 background-color: #E6ECEF;
@@ -395,60 +339,100 @@ class ValidateOutputWidget(QWidget):
                 padding: 2px;
             }
         """)
-
-        # Connect signals
         self.validate_pdf_btn.clicked.connect(self.validate_pdf)
         self.validate_html_btn.clicked.connect(self.validate_html)
-        self.back_btn.clicked.connect(self.parent_window.return_to_main_menu)
+        self.back_btn.clicked.connect(self.cancel_and_return)
 
-        # Threads for validation
         self.table_check_thread = None
         self.link_check_thread = None
         self.html_validation_thread = None
 
+    def open_markdown_help(self, button_name):
+        md_name = button_name.lower().replace(" ", "_") + ".md"
+        md_path = os.path.join(os.path.dirname(__file__), "docs", md_name)
+        if not os.path.exists(md_path):
+            return
+        viewer = MarkdownViewer(md_path, button_name, self.parent_window)
+        viewer.show()
+        self.markdown_viewers.append(viewer)
+
+    def update_help_ui(self):
+        help_enabled = self.parent_window.help_enabled if self.parent_window else False
+        for label in self.button_info_labels.values():
+            label.setVisible(help_enabled)
+
     def clear_content(self):
-        while self.content_layout.count():
-            item = self.content_layout.takeAt(0)
+        for i in reversed(range(self.content_layout.count())):
+            item = self.content_layout.itemAt(i)
             if item.widget():
-                item.widget().setParent(None)
+                widget = item.widget()
+                self.content_layout.removeWidget(widget)
+                widget.setParent(None)
+            elif item.layout():
+                self.clear_layout(item.layout())
+
+    def clear_layout(self, layout):
+        while layout.count():
+            item = layout.takeAt(0)
+            if item.widget():
+                widget = item.widget()
+                widget.setParent(None)
+            elif item.layout():
+                self.clear_layout(item.layout())
 
     def reset_widget(self):
-        """Reset the widget to its initial state."""
+        self.cancel_checks()
         self.clear_content()
         self.pdf_path = None
         self.html_path = None
-        self.feedback_label.setText("Select a check to begin")
+        self.validation_report = None
+        self.feedback_label.setText("Select a check to continue")
         self.feedback_label.setFont(QFont("Helvetica", 12))
-        self.feedback_label.setVisible(True)
-        self.table.setVisible(False)
-        self.content_layout.addWidget(self.feedback_label, stretch=1)
+        self.feedback_label.setStyleSheet("color: #FFFFFF; background-color: transparent;")
+        self.feedback_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.content_layout.addWidget(self.feedback_label, stretch=0)
         self.validate_pdf_btn.setText("Validate PDF")
         self.validate_html_btn.setText("Validate HTML")
         self.validate_pdf_btn.clicked.disconnect()
         self.validate_html_btn.clicked.disconnect()
         self.validate_pdf_btn.clicked.connect(self.validate_pdf)
         self.validate_html_btn.clicked.connect(self.validate_html)
+        self.back_btn.clicked.disconnect()
+        self.back_btn.clicked.connect(self.cancel_and_return)
         self.validate_pdf_btn.setEnabled(True)
         self.validate_html_btn.setEnabled(True)
-        self.back_btn.clicked.disconnect()
-        self.back_btn.clicked.connect(self.parent_window.return_to_main_menu)
-        self.back_btn.setEnabled(True)
 
     def cancel_checks(self):
         if self.table_check_thread and self.table_check_thread.isRunning():
             self.table_check_thread.cancel()
-            self.table_check_thread.wait()
+            self.table_check_thread = None
         if self.link_check_thread and self.link_check_thread.isRunning():
             self.link_check_thread.cancel()
-            self.link_check_thread.wait()
+            self.link_check_thread = None
         if self.html_validation_thread and self.html_validation_thread.isRunning():
             self.html_validation_thread.cancel()
-            self.html_validation_thread.wait()
-        self.feedback_label.setText("Validation canceled")
-        self.feedback_label.setVisible(True)
-        self.table.setVisible(False)
+            self.html_validation_thread = None
         self.clear_content()
-        self.content_layout.addWidget(self.feedback_label, stretch=1)
+        self.feedback_label.setText("Validation canceled")
+        self.feedback_label.setFont(QFont("Helvetica", 12))
+        self.feedback_label.setStyleSheet("color: #FFFFFF; background-color: transparent;")
+        self.feedback_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.content_layout.addWidget(self.feedback_label, stretch=0)
+        self.validate_pdf_btn.setEnabled(True)
+        self.validate_html_btn.setEnabled(True)
+
+    def cancel_and_return(self):
+        self.cancel_checks()
+        if self.link_check_thread:
+            self.link_check_thread.wait(2000)
+            self.link_check_thread = None
+        if self.table_check_thread:
+            self.table_check_thread.wait(2000)
+            self.table_check_thread = None
+        if self.html_validation_thread:
+            self.html_validation_thread.wait(2000)
+            self.html_validation_thread = None
+        self.parent_window.return_to_main_menu()
 
     def validate_metadata(self, pdf_path):
         reader = PyPDF2.PdfReader(pdf_path)
@@ -471,6 +455,12 @@ class ValidateOutputWidget(QWidget):
 
     def validate_pdf(self):
         self.clear_content()
+        self.feedback_label.setVisible(True)
+        self.feedback_label.setText("Select a PDF file...")
+        self.feedback_label.setFont(QFont("Helvetica", 12))
+        self.feedback_label.setStyleSheet("color: #FFFFFF; background-color: transparent;")
+        self.feedback_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.content_layout.addWidget(self.feedback_label, stretch=0)
         self.validate_pdf_btn.setEnabled(False)
         self.validate_html_btn.setEnabled(False)
         pdf_path, _ = QFileDialog.getOpenFileName(
@@ -480,56 +470,23 @@ class ValidateOutputWidget(QWidget):
             "PDF Files (*.pdf);;All Files (*)"
         )
         if not pdf_path:
-            self.feedback_label.setText("No PDF selected")
+            self.clear_content()
+            self.feedback_label.setText("Select a check to continue")
+            self.feedback_label.setFont(QFont("Helvetica", 12))
+            self.feedback_label.setStyleSheet("color: #FFFFFF; background-color: transparent;")
+            self.feedback_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
             self.feedback_label.setVisible(True)
-            self.table.setVisible(False)
-            self.content_layout.addWidget(self.feedback_label, stretch=1)
-            self.validate_pdf_btn.setText("Validate PDF")
-            self.validate_html_btn.setText("Validate HTML")
-            self.validate_pdf_btn.clicked.disconnect()
-            self.validate_html_btn.clicked.disconnect()
-            self.validate_pdf_btn.clicked.connect(self.validate_pdf)
-            self.validate_html_btn.clicked.connect(self.validate_html)
-            self.back_btn.clicked.disconnect()
-            self.back_btn.clicked.connect(self.parent_window.return_to_main_menu)
+            self.content_layout.addWidget(self.feedback_label, stretch=0)
             self.validate_pdf_btn.setEnabled(True)
             self.validate_html_btn.setEnabled(True)
             return
         try:
             if not os.path.exists(pdf_path):
-                self.feedback_label.setText("Error: PDF file does not exist")
-                self.feedback_label.setVisible(True)
-                self.table.setVisible(False)
-                self.content_layout.addWidget(self.feedback_label, stretch=1)
-                self.validate_pdf_btn.setText("Validate PDF")
-                self.validate_html_btn.setText("Validate HTML")
-                self.validate_pdf_btn.clicked.disconnect()
-                self.validate_html_btn.clicked.disconnect()
-                self.validate_pdf_btn.clicked.connect(self.validate_pdf)
-                self.validate_html_btn.clicked.connect(self.validate_html)
-                self.back_btn.clicked.disconnect()
-                self.back_btn.clicked.connect(self.parent_window.return_to_main_menu)
-                self.validate_pdf_btn.setEnabled(True)
-                self.validate_html_btn.setEnabled(True)
-                return
+                raise FileNotFoundError("PDF file does not exist")
             file_size_bytes = os.path.getsize(pdf_path)
             file_size_mb = file_size_bytes / (1024 * 1024)
             if file_size_bytes == 0:
-                self.feedback_label.setText("Error: PDF file is empty")
-                self.feedback_label.setVisible(True)
-                self.table.setVisible(False)
-                self.content_layout.addWidget(self.feedback_label, stretch=1)
-                self.validate_pdf_btn.setText("Validate PDF")
-                self.validate_html_btn.setText("Validate HTML")
-                self.validate_pdf_btn.clicked.disconnect()
-                self.validate_html_btn.clicked.disconnect()
-                self.validate_pdf_btn.clicked.connect(self.validate_pdf)
-                self.validate_html_btn.clicked.connect(self.validate_html)
-                self.back_btn.clicked.disconnect()
-                self.back_btn.clicked.connect(self.parent_window.return_to_main_menu)
-                self.validate_pdf_btn.setEnabled(True)
-                self.validate_html_btn.setEnabled(True)
-                return
+                raise ValueError("PDF file is empty")
             metadata_info = self.validate_metadata(pdf_path)
             reader = metadata_info["reader"]
             page_count = len(reader.pages)
@@ -543,11 +500,13 @@ class ValidateOutputWidget(QWidget):
                 f"Subject: {metadata_info['subject']}",
                 f"Keywords: {metadata_info['keywords']}"
             ]
+            self.clear_content()
             self.feedback_label.setFont(QFont("Helvetica", 12))
             self.feedback_label.setText("\n".join(metadata_lines))
+            self.feedback_label.setStyleSheet("color: #FFFFFF; background-color: transparent;")
+            self.feedback_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
             self.feedback_label.setVisible(True)
-            self.table.setVisible(False)
-            self.content_layout.addWidget(self.feedback_label, stretch=1)
+            self.content_layout.addWidget(self.feedback_label, stretch=0)
             self.validate_pdf_btn.setText("Check Links")
             self.validate_html_btn.setText("Check Tables")
             self.validate_pdf_btn.clicked.disconnect()
@@ -560,11 +519,13 @@ class ValidateOutputWidget(QWidget):
             self.validate_html_btn.setEnabled(True)
             self.pdf_path = pdf_path
         except PyPDF2.errors.PdfReadError:
-            self.feedback_label.setFont(QFont("Helvetica", 12))
+            self.clear_content()
             self.feedback_label.setText("Error: Invalid PDF structure")
+            self.feedback_label.setFont(QFont("Helvetica", 12))
+            self.feedback_label.setStyleSheet("color: #FFFFFF; background-color: transparent;")
+            self.feedback_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
             self.feedback_label.setVisible(True)
-            self.table.setVisible(False)
-            self.content_layout.addWidget(self.feedback_label, stretch=1)
+            self.content_layout.addWidget(self.feedback_label, stretch=0)
             self.validate_pdf_btn.setText("Validate PDF")
             self.validate_html_btn.setText("Validate HTML")
             self.validate_pdf_btn.clicked.disconnect()
@@ -572,15 +533,17 @@ class ValidateOutputWidget(QWidget):
             self.validate_pdf_btn.clicked.connect(self.validate_pdf)
             self.validate_html_btn.clicked.connect(self.validate_html)
             self.back_btn.clicked.disconnect()
-            self.back_btn.clicked.connect(self.parent_window.return_to_main_menu)
+            self.back_btn.clicked.connect(self.cancel_and_return)
             self.validate_pdf_btn.setEnabled(True)
             self.validate_html_btn.setEnabled(True)
         except PermissionError:
-            self.feedback_label.setFont(QFont("Helvetica", 12))
+            self.clear_content()
             self.feedback_label.setText("Error: Permission denied accessing PDF")
+            self.feedback_label.setFont(QFont("Helvetica", 12))
+            self.feedback_label.setStyleSheet("color: #FFFFFF; background-color: transparent;")
+            self.feedback_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
             self.feedback_label.setVisible(True)
-            self.table.setVisible(False)
-            self.content_layout.addWidget(self.feedback_label, stretch=1)
+            self.content_layout.addWidget(self.feedback_label, stretch=0)
             self.validate_pdf_btn.setText("Validate PDF")
             self.validate_html_btn.setText("Validate HTML")
             self.validate_pdf_btn.clicked.disconnect()
@@ -588,15 +551,17 @@ class ValidateOutputWidget(QWidget):
             self.validate_pdf_btn.clicked.connect(self.validate_pdf)
             self.validate_html_btn.clicked.connect(self.validate_html)
             self.back_btn.clicked.disconnect()
-            self.back_btn.clicked.connect(self.parent_window.return_to_main_menu)
+            self.back_btn.clicked.connect(self.cancel_and_return)
             self.validate_pdf_btn.setEnabled(True)
             self.validate_html_btn.setEnabled(True)
         except Exception as e:
-            self.feedback_label.setFont(QFont("Helvetica", 12))
+            self.clear_content()
             self.feedback_label.setText(f"Error: Failed to validate PDF: {str(e)}")
+            self.feedback_label.setFont(QFont("Helvetica", 12))
+            self.feedback_label.setStyleSheet("color: #FFFFFF; background-color: transparent;")
+            self.feedback_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
             self.feedback_label.setVisible(True)
-            self.table.setVisible(False)
-            self.content_layout.addWidget(self.feedback_label, stretch=1)
+            self.content_layout.addWidget(self.feedback_label, stretch=0)
             self.validate_pdf_btn.setText("Validate PDF")
             self.validate_html_btn.setText("Validate HTML")
             self.validate_pdf_btn.clicked.disconnect()
@@ -604,14 +569,21 @@ class ValidateOutputWidget(QWidget):
             self.validate_pdf_btn.clicked.connect(self.validate_pdf)
             self.validate_html_btn.clicked.connect(self.validate_html)
             self.back_btn.clicked.disconnect()
-            self.back_btn.clicked.connect(self.parent_window.return_to_main_menu)
+            self.back_btn.clicked.connect(self.cancel_and_return)
             self.validate_pdf_btn.setEnabled(True)
             self.validate_html_btn.setEnabled(True)
 
     def validate_html(self):
         self.clear_content()
+        self.feedback_label.setVisible(True)
+        self.feedback_label.setText("Select an HTML file...")
+        self.feedback_label.setFont(QFont("Helvetica", 12))
+        self.feedback_label.setStyleSheet("color: #FFFFFF; background-color: transparent;")
+        self.feedback_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.content_layout.addWidget(self.feedback_label, stretch=0)
         self.validate_pdf_btn.setEnabled(False)
         self.validate_html_btn.setEnabled(False)
+        self.back_btn.setEnabled(False)
         html_path, _ = QFileDialog.getOpenFileName(
             self,
             "Select HTML File (index.html)",
@@ -619,21 +591,16 @@ class ValidateOutputWidget(QWidget):
             "HTML Files (index.html);;All Files (*)"
         )
         if not html_path:
+            self.clear_content()
+            self.feedback_label.setText("Select a check to continue")
             self.feedback_label.setFont(QFont("Helvetica", 12))
-            self.feedback_label.setText("No HTML file selected")
+            self.feedback_label.setStyleSheet("color: #FFFFFF; background-color: transparent;")
+            self.feedback_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
             self.feedback_label.setVisible(True)
-            self.table.setVisible(False)
-            self.content_layout.addWidget(self.feedback_label, stretch=1)
-            self.validate_pdf_btn.setText("Validate PDF")
-            self.validate_html_btn.setText("Validate HTML")
-            self.validate_pdf_btn.clicked.disconnect()
-            self.validate_html_btn.clicked.disconnect()
-            self.validate_pdf_btn.clicked.connect(self.validate_pdf)
-            self.validate_html_btn.clicked.connect(self.validate_html)
-            self.back_btn.clicked.disconnect()
-            self.back_btn.clicked.connect(self.parent_window.return_to_main_menu)
+            self.content_layout.addWidget(self.feedback_label, stretch=0)
             self.validate_pdf_btn.setEnabled(True)
             self.validate_html_btn.setEnabled(True)
+            self.back_btn.setEnabled(True)
             return
         try:
             if not os.path.exists(html_path):
@@ -643,419 +610,382 @@ class ValidateOutputWidget(QWidget):
             if file_size_bytes == 0:
                 raise ValueError("HTML file is empty")
             file_name = os.path.basename(html_path)
+            self.clear_content()
             self.feedback_label.setFont(QFont("Helvetica", 12))
-            self.feedback_label.setText(f"HTML File: {file_name}\nSize: {file_size_mb:.2f} MB")
+            self.feedback_label.setText(f"Validating HTML: {file_name}\nSize: {file_size_mb:.2f} MB\nProcessing...")
+            self.feedback_label.setStyleSheet("color: #FFFFFF; background-color: transparent;")
+            self.feedback_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
             self.feedback_label.setVisible(True)
-            self.table.setVisible(False)
-            self.content_layout.addWidget(self.feedback_label, stretch=1)
-            self.validate_pdf_btn.setText("Validate Internal Links")
-            self.validate_html_btn.setText("Validate Images")
-            self.validate_pdf_btn.clicked.disconnect()
-            self.validate_html_btn.clicked.disconnect()
-            self.validate_pdf_btn.clicked.connect(self.validate_internal_links)
-            self.validate_html_btn.clicked.connect(self.validate_images)
-            self.back_btn.clicked.disconnect()
-            self.back_btn.clicked.connect(self.reset_widget)
-            self.validate_pdf_btn.setEnabled(True)
-            self.validate_html_btn.setEnabled(True)
+            self.content_layout.addWidget(self.feedback_label, stretch=0)
+            QApplication.processEvents()
             self.html_path = html_path
+            self.html_validation_thread = HTMLValidationThread(self.html_path, "links_and_images")
+            self.html_validation_thread.result.connect(self.display_html_report)
+            self.html_validation_thread.start()
         except FileNotFoundError:
-            self.feedback_label.setFont(QFont("Helvetica", 12))
+            self.clear_content()
             self.feedback_label.setText("Error: HTML file does not exist")
+            self.feedback_label.setFont(QFont("Helvetica", 12))
+            self.feedback_label.setStyleSheet("color: #FFFFFF; background-color: transparent;")
+            self.feedback_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
             self.feedback_label.setVisible(True)
-            self.table.setVisible(False)
-            self.content_layout.addWidget(self.feedback_label, stretch=1)
-            self.validate_pdf_btn.setText("Validate PDF")
-            self.validate_html_btn.setText("Validate HTML")
-            self.validate_pdf_btn.clicked.disconnect()
-            self.validate_html_btn.clicked.disconnect()
-            self.validate_pdf_btn.clicked.connect(self.validate_pdf)
-            self.validate_html_btn.clicked.connect(self.validate_html)
-            self.back_btn.clicked.disconnect()
-            self.back_btn.clicked.connect(self.parent_window.return_to_main_menu)
+            self.content_layout.addWidget(self.feedback_label, stretch=0)
             self.validate_pdf_btn.setEnabled(True)
             self.validate_html_btn.setEnabled(True)
+            self.back_btn.setEnabled(True)
         except ValueError:
-            self.feedback_label.setFont(QFont("Helvetica", 12))
+            self.clear_content()
             self.feedback_label.setText("Error: HTML file is empty")
-            self.feedback_label.setVisible(True)
-            self.table.setVisible(False)
-            self.content_layout.addWidget(self.feedback_label, stretch=1)
-            self.validate_pdf_btn.setText("Validate PDF")
-            self.validate_html_btn.setText("Validate HTML")
-            self.validate_pdf_btn.clicked.disconnect()
-            self.validate_html_btn.clicked.disconnect()
-            self.validate_pdf_btn.clicked.connect(self.validate_pdf)
-            self.validate_html_btn.clicked.connect(self.validate_html)
-            self.back_btn.clicked.disconnect()
-            self.back_btn.clicked.connect(self.parent_window.return_to_main_menu)
-            self.validate_pdf_btn.setEnabled(True)
-            self.validate_html_btn.setEnabled(True)
-        except Exception as e:
             self.feedback_label.setFont(QFont("Helvetica", 12))
-            self.feedback_label.setText(f"Error: Failed to validate HTML: {str(e)}")
+            self.feedback_label.setStyleSheet("color: #FFFFFF; background-color: transparent;")
+            self.feedback_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
             self.feedback_label.setVisible(True)
-            self.table.setVisible(False)
-            self.content_layout.addWidget(self.feedback_label, stretch=1)
-            self.validate_pdf_btn.setText("Validate PDF")
-            self.validate_html_btn.setText("Validate HTML")
-            self.validate_pdf_btn.clicked.disconnect()
-            self.validate_html_btn.clicked.disconnect()
-            self.validate_pdf_btn.clicked.connect(self.validate_pdf)
-            self.validate_html_btn.clicked.connect(self.validate_html)
-            self.back_btn.clicked.disconnect()
-            self.back_btn.clicked.connect(self.parent_window.return_to_main_menu)
+            self.content_layout.addWidget(self.feedback_label, stretch=0)
             self.validate_pdf_btn.setEnabled(True)
             self.validate_html_btn.setEnabled(True)
+            self.back_btn.setEnabled(True)
+        except Exception as e:
+            self.clear_content()
+            self.feedback_label.setText(f"Error: Failed to start HTML validation: {str(e)}")
+            self.feedback_label.setFont(QFont("Helvetica", 12))
+            self.feedback_label.setStyleSheet("color: #FFFFFF; background-color: transparent;")
+            self.feedback_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+            self.feedback_label.setVisible(True)
+            self.content_layout.addWidget(self.feedback_label, stretch=0)
+            self.validate_pdf_btn.setEnabled(True)
+            self.validate_html_btn.setEnabled(True)
+            self.back_btn.setEnabled(True)
 
     def check_tables(self):
         if not self.pdf_path:
-            self.feedback_label.setFont(QFont("Helvetica", 12))
-            self.feedback_label.setText("Table Check: No PDF selected")
-            self.feedback_label.setVisible(True)
-            self.table.setVisible(False)
             self.clear_content()
-            self.content_layout.addWidget(self.feedback_label, stretch=1)
+            self.feedback_label.setText("Select a check to continue")
+            self.feedback_label.setFont(QFont("Helvetica", 12))
+            self.feedback_label.setStyleSheet("color: #FFFFFF; background-color: transparent;")
+            self.feedback_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+            self.content_layout.addWidget(self.feedback_label, stretch=0)
+            self.validate_pdf_btn.setEnabled(True)
+            self.validate_html_btn.setEnabled(True)
+            self.back_btn.setEnabled(True)
             return
         self.validate_pdf_btn.setEnabled(False)
         self.validate_html_btn.setEnabled(False)
-        self.back_btn.setEnabled(False)
-        self.feedback_label.setFont(QFont("Helvetica", 12))
-        self.feedback_label.setText("Table Check: Processing...")
-        self.feedback_label.setVisible(True)
-        self.table.setVisible(False)
         self.clear_content()
-        self.content_layout.addWidget(self.feedback_label, stretch=1)
+        self.feedback_label.setFont(QFont("Helvetica", 12))
+        self.feedback_label.setText("Table Check: Processing... (Click Back to cancel)")
+        self.feedback_label.setStyleSheet("color: #FFFFFF; background-color: transparent;")
+        self.feedback_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.feedback_label.setVisible(True)
+        self.content_layout.addWidget(self.feedback_label, stretch=0)
+        QApplication.processEvents()
         self.table_check_thread = TableCheckThread(self.pdf_path)
-        self.table_check_thread.progress.connect(self.update_table_progress)
-        self.table_check_thread.update_progress_value.connect(self.update_table_progress_value)
         self.table_check_thread.result.connect(self.display_table_report)
         self.table_check_thread.start()
 
-    def update_table_progress(self, message):
-        current_time = time.time()
-        if current_time - self.last_progress_update < 0.5:
+    def check_links(self):
+        if not self.pdf_path:
+            self.clear_content()
+            self.feedback_label.setText("Select a check to continue")
+            self.feedback_label.setFont(QFont("Helvetica", 12))
+            self.feedback_label.setStyleSheet("color: #FFFFFF; background-color: transparent;")
+            self.feedback_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+            self.feedback_label.setVisible(True)
+            self.content_layout.addWidget(self.feedback_label, stretch=0)
+            self.validate_pdf_btn.setEnabled(True)
+            self.validate_html_btn.setEnabled(True)
+            self.back_btn.setEnabled(True)
             return
-        self.last_progress_update = current_time
-        self.feedback_label.setFont(QFont("Helvetica", 12))
-        self.feedback_label.setText(f"Table Check: {message}")
-        self.feedback_label.setVisible(True)
-        self.table.setVisible(False)
+        self.validate_pdf_btn.setEnabled(False)
+        self.validate_html_btn.setEnabled(False)
         self.clear_content()
-        self.content_layout.addWidget(self.feedback_label, stretch=1)
+        self.feedback_label.setFont(QFont("Helvetica", 12))
+        self.feedback_label.setText("Link Report: Processing... (Click Back to cancel)")
+        self.feedback_label.setStyleSheet("color: #FFFFFF; background-color: transparent;")
+        self.feedback_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.feedback_label.setVisible(True)
+        self.content_layout.addWidget(self.feedback_label, stretch=0)
         QApplication.processEvents()
-
-    def update_table_progress_value(self, value):
-        pass
+        self.link_check_thread = LinkCheckThread(self.pdf_path)
+        self.link_check_thread.result.connect(self.display_link_report)
+        self.link_check_thread.start()
 
     def display_table_report(self, overflow_pages):
         self.clear_content()
         self.feedback_label.setFont(QFont("Helvetica", 14, QFont.Weight.Bold))
-        if isinstance(overflow_pages, list) and overflow_pages and isinstance(overflow_pages[0], str) and overflow_pages[0].startswith("Error"):
+        if not overflow_pages or (isinstance(overflow_pages, list) and len(overflow_pages) == 0):
+            self.feedback_label.setText("No overflowing tables detected")
+            self.feedback_label.setStyleSheet("color: #FFFFFF; background-color: transparent;")
+            self.feedback_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+            self.feedback_label.setVisible(True)
+            self.content_layout.addWidget(self.feedback_label, stretch=0)
+        elif isinstance(overflow_pages, list) and overflow_pages and isinstance(overflow_pages[0], str) and overflow_pages[0].startswith("Error"):
             self.feedback_label.setText(f"Table Check: {overflow_pages[0]}")
+            self.feedback_label.setStyleSheet("color: #FFFFFF; background-color: transparent;")
+            self.feedback_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+            self.feedback_label.setVisible(True)
+            self.content_layout.addWidget(self.feedback_label, stretch=0)
         elif overflow_pages:
-            overflow_text = "Table Check: Overflowing Tables Detected on Pages:\n" + "\n".join(f"--Page {page}" for page in sorted(overflow_pages, key=lambda x: (x.isdigit(), x)))
+            try:
+                overflow_pages.sort(key=lambda x: (0, int(x)) if x.isdigit() else (1, x.lower()))
+                overflow_text = "Overflowing Table Detected on Pages:\n" + "\n".join(f"--Page {p}" for p in overflow_pages)
+            except (ValueError, TypeError):
+                overflow_text = "Overflowing Table Detected on Pages:\n" + "\n".join(f"--Page {p}" for p in overflow_pages)
             self.feedback_label.setText(overflow_text)
+            self.feedback_label.setStyleSheet("color: #FFFFFF; background-color: transparent;")
+            self.feedback_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+            self.feedback_label.setVisible(True)
+            self.content_layout.addWidget(self.feedback_label, stretch=0)
         else:
-            self.feedback_label.setText("Table Check: No Overflowing Tables Detected")
-        self.feedback_label.setVisible(True)
-        self.table.setVisible(False)
-        self.content_layout.addWidget(self.feedback_label, stretch=1)
+            self.feedback_label.setText("No Overflowing Tables Detected")
+            self.feedback_label.setStyleSheet("color: #FFFFFF; background-color: transparent;")
+            self.feedback_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+            self.feedback_label.setVisible(True)
+            self.content_layout.addWidget(self.feedback_label, stretch=0)
         self.validate_pdf_btn.setEnabled(True)
         self.validate_html_btn.setEnabled(True)
         self.back_btn.setEnabled(True)
-
-    def check_links(self):
-        if not self.pdf_path:
-            self.feedback_label.setFont(QFont("Helvetica", 12))
-            self.feedback_label.setText("Link Report: No PDF selected")
-            self.feedback_label.setVisible(True)
-            self.table.setVisible(False)
-            self.clear_content()
-            self.content_layout.addWidget(self.feedback_label, stretch=1)
-            return
-        self.validate_pdf_btn.setEnabled(False)
-        self.validate_html_btn.setEnabled(False)
-        self.back_btn.setEnabled(False)
-        self.feedback_label.setFont(QFont("Helvetica", 12))
-        self.feedback_label.setText("Link Report: Processing...")
-        self.feedback_label.setVisible(True)
-        self.table.setVisible(False)
-        self.clear_content()
-        self.content_layout.addWidget(self.feedback_label, stretch=1)
-        self.link_check_thread = LinkCheckThread(self.pdf_path)
-        self.link_check_thread.progress.connect(self.update_link_progress)
-        self.link_check_thread.update_progress_value.connect(self.update_link_progress_value)
-        self.link_check_thread.result.connect(self.display_link_report)
-        self.link_check_thread.start()
-
-    def update_link_progress(self, message):
-        current_time = time.time()
-        if current_time - self.last_progress_update < 0.5:
-            return
-        self.last_progress_update = current_time
-        self.feedback_label.setFont(QFont("Helvetica", 12))
-        self.feedback_label.setText(f"Link Report: {message}")
-        self.feedback_label.setVisible(True)
-        self.table.setVisible(False)
-        self.clear_content()
-        self.content_layout.addWidget(self.feedback_label, stretch=1)
-        QApplication.processEvents()
-
-    def update_link_progress_value(self, value):
-        pass
 
     def display_link_report(self, link_report):
         self.clear_content()
         self.feedback_label.setFont(QFont("Helvetica", 12))
-        if "error" in link_report:
-            self.feedback_label.setText(f"Link Report: {link_report['error']}")
-            self.feedback_label.setVisible(True)
-            self.table.setVisible(False)
-            self.content_layout.addWidget(self.feedback_label, stretch=1)
-        elif "total_links" in link_report:
-            total_links = link_report["total_links"]
-            redirected_links = link_report.get("redirected", [])
-            invalid_links = link_report.get("invalid", [])
-            unreachable_links = link_report.get("unreachable", [])
-            self.feedback_label.setText(f"Link Report: {total_links} Hyperlinks Present.")
+        if not isinstance(link_report, dict):
+            self.feedback_label.setText("Link Report: Invalid response format")
+            self.feedback_label.setStyleSheet("color: #FFFFFF; background-color: transparent;")
+            self.feedback_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
             self.feedback_label.setVisible(True)
             self.content_layout.addWidget(self.feedback_label, stretch=0)
-            if not redirected_links and not invalid_links and not unreachable_links:
-                self.feedback_label.setText(self.feedback_label.text() + "\nAll links are valid with no redirects or errors.")
+        elif "error" in link_report:
+            self.feedback_label.setText(f"Link Report: {link_report['error']}")
+            self.feedback_label.setStyleSheet("color: #FFFFFF; background-color: transparent;")
+            self.feedback_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+            self.feedback_label.setVisible(True)
+            self.content_layout.addWidget(self.feedback_label, stretch=0)
+        elif "result" in link_report:
+            external = link_report["result"]
+            total_external = external.get("total_links", 0)
+            redirected_links = external.get("redirected", [])
+            invalid_external = external.get("invalid", [])
+            unreachable_links = external.get("unreachable", [])
+            self.feedback_label.setText(f"Link Report: {total_external} External Links.")
+            self.feedback_label.setStyleSheet("color: #FFFFFF; background-color: transparent;")
+            self.feedback_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+            self.feedback_label.setVisible(True)
+            self.content_layout.addWidget(self.feedback_label, stretch=0)
+            if not (redirected_links or invalid_external or unreachable_links):
+                self.feedback_label.setText(self.feedback_label.text() + "\nAll external links are valid.")
             else:
-                self.table.setRowCount(len(redirected_links) + len(invalid_links) + len(unreachable_links))
-                self.table.setColumnCount(4)
-                self.table.setHorizontalHeaderLabels(["Page Number", "Link", "Redirector Link", "Status"])
-                header = self.table.horizontalHeader()
-                header.setSectionResizeMode(0, QHeaderView.ResizeMode.ResizeToContents)
-                header.setSectionResizeMode(1, QHeaderView.ResizeMode.Stretch)
-                header.setSectionResizeMode(2, QHeaderView.ResizeMode.Stretch)
-                header.setSectionResizeMode(3, QHeaderView.ResizeMode.ResizeToContents)
-                self.table.setWordWrap(True)
-                row = 0
-                for link in redirected_links:
-                    page_numbers = ", ".join(sorted(link['pages'], key=lambda x: (x.isdigit(), x)))
-                    self.table.setItem(row, 0, QTableWidgetItem(page_numbers))
-                    link_item = QTableWidgetItem(link['url'])
+                external_label = QLabel("External Link Validation Results:")
+                external_label.setFont(QFont("Helvetica", 12, QFont.Weight.Bold))
+                external_label.setStyleSheet("color: #FFFFFF; background-color: transparent;")
+                self.content_layout.addWidget(external_label, stretch=0)
+                self.external_table.setRowCount(len(redirected_links) + len(invalid_external) + len(unreachable_links))
+                self.external_table.setColumnCount(4)
+                self.external_table.setHorizontalHeaderLabels(["Pages", "Link", "Redirector Link", "Status"])
+                external_header = self.external_table.horizontalHeader()
+                external_header.setSectionResizeMode(QHeaderView.ResizeMode.Stretch)
+                self.external_table.setWordWrap(True)
+                self.external_table.setColumnWidth(3, 200)
+                for row, issue in enumerate(redirected_links + invalid_external + unreachable_links):
+                    page_item = QTableWidgetItem(", ".join(issue["pages"]))
+                    page_item.setFlags(Qt.ItemFlag.ItemIsSelectable | Qt.ItemFlag.ItemIsEnabled)
+                    page_item.setToolTip(f"Pages: {', '.join(issue['pages'])}")
+                    self.external_table.setItem(row, 0, page_item)
+                    link_item = QTableWidgetItem(issue["url"])
                     link_font = QFont("Helvetica", 12)
                     link_font.setUnderline(True)
                     link_item.setFont(link_font)
                     link_item.setForeground(QColor("#0D6E6E"))
-                    link_item.setData(Qt.ItemDataRole.UserRole, link['url'])
+                    link_item.setData(Qt.ItemDataRole.UserRole, issue["url"])
                     link_item.setFlags(Qt.ItemFlag.ItemIsSelectable | Qt.ItemFlag.ItemIsEnabled)
-                    link_item.setToolTip(f"Click to open: {link['url']}")
-                    self.table.setItem(row, 1, link_item)
-                    redirector_item = QTableWidgetItem(link.get('redirected_to', 'N/A'))
-                    if link.get('redirected_to'):
+                    link_item.setToolTip(f"Click to open: {issue['url']}")
+                    self.external_table.setItem(row, 1, link_item)
+                    redirector_item = QTableWidgetItem(issue.get("redirected_to", "N/A"))
+                    if issue.get("redirected_to"):
                         redirector_font = QFont("Helvetica", 12)
                         redirector_font.setUnderline(True)
                         redirector_item.setFont(redirector_font)
                         redirector_item.setForeground(QColor("#0D6E6E"))
-                        redirector_item.setData(Qt.ItemDataRole.UserRole, link['redirected_to'])
+                        redirector_item.setData(Qt.ItemDataRole.UserRole, issue["redirected_to"])
                         redirector_item.setFlags(Qt.ItemFlag.ItemIsSelectable | Qt.ItemFlag.ItemIsEnabled)
-                        redirector_item.setToolTip(f"Click to open: {link['redirected_to']}")
-                    self.table.setItem(row, 2, redirector_item)
-                    self.table.setItem(row, 3, QTableWidgetItem(link['reason']))
-                    row += 1
-                for link in invalid_links:
-                    page_numbers = ", ".join(sorted(link['pages'], key=lambda x: (x.isdigit(), x)))
-                    self.table.setItem(row, 0, QTableWidgetItem(page_numbers))
-                    link_item = QTableWidgetItem(link['url'])
-                    link_font = QFont("Helvetica", 12)
-                    link_font.setUnderline(True)
-                    link_item.setFont(link_font)
-                    link_item.setForeground(QColor("#0D6E6E"))
-                    link_item.setData(Qt.ItemDataRole.UserRole, link['url'])
-                    link_item.setFlags(Qt.ItemFlag.ItemIsSelectable | Qt.ItemFlag.ItemIsEnabled)
-                    link_item.setToolTip(f"Click to open: {link['url']}")
-                    self.table.setItem(row, 1, link_item)
-                    self.table.setItem(row, 2, QTableWidgetItem("N/A"))
-                    self.table.setItem(row, 3, QTableWidgetItem(link['reason']))
-                    row += 1
-                for link in unreachable_links:
-                    page_numbers = ", ".join(sorted(link['pages'], key=lambda x: (x.isdigit(), x)))
-                    self.table.setItem(row, 0, QTableWidgetItem(page_numbers))
-                    link_item = QTableWidgetItem(link['url'])
-                    link_font = QFont("Helvetica", 12)
-                    link_font.setUnderline(True)
-                    link_item.setFont(link_font)
-                    link_item.setForeground(QColor("#0D6E6E"))
-                    link_item.setData(Qt.ItemDataRole.UserRole, link['url'])
-                    link_item.setFlags(Qt.ItemFlag.ItemIsSelectable | Qt.ItemFlag.ItemIsEnabled)
-                    link_item.setToolTip(f"Click to open: {link['url']}")
-                    self.table.setItem(row, 1, link_item)
-                    self.table.setItem(row, 2, QTableWidgetItem("N/A"))
-                    self.table.setItem(row, 3, QTableWidgetItem(link['reason']))
-                    row += 1
-                self.table.resizeRowsToContents()
-                self.table.cellClicked.connect(self.open_url)
-                self.table.setVisible(True)
-                self.content_layout.addWidget(self.table, stretch=1)
+                        redirector_item.setToolTip(f"Click to open: {issue['redirected_to']}")
+                    self.external_table.setItem(row, 2, redirector_item)
+                    status_item = QTableWidgetItem(issue["reason"])
+                    status_item.setFlags(Qt.ItemFlag.ItemIsSelectable | Qt.ItemFlag.ItemIsEnabled)
+                    self.external_table.setItem(row, 3, status_item)
+                self.external_table.resizeRowsToContents()
+                self.external_table.cellClicked.connect(self.open_external_url)
+                self.external_table.setVisible(True)
+                self.content_layout.addWidget(self.external_table, stretch=0)
         self.validate_pdf_btn.setEnabled(True)
         self.validate_html_btn.setEnabled(True)
         self.back_btn.setEnabled(True)
 
-    def validate_internal_links(self):
-        if not self.html_path:
-            self.feedback_label.setFont(QFont("Helvetica", 12))
-            self.feedback_label.setText("Internal Links Validation: No HTML file selected")
-            self.feedback_label.setVisible(True)
-            self.table.setVisible(False)
-            self.clear_content()
-            self.content_layout.addWidget(self.feedback_label, stretch=1)
-            return
-        self.validate_pdf_btn.setEnabled(False)
-        self.validate_html_btn.setEnabled(False)
-        self.back_btn.setEnabled(False)
-        self.feedback_label.setFont(QFont("Helvetica", 12))
-        self.feedback_label.setText("Internal Links Validation: Processing...")
-        self.feedback_label.setVisible(True)
-        self.table.setVisible(False)
-        self.clear_content()
-        self.content_layout.addWidget(self.feedback_label, stretch=1)
-        self.html_validation_thread = HTMLValidationThread(self.html_path, "internal_links")
-        self.html_validation_thread.progress.connect(self.update_html_progress)
-        self.html_validation_thread.folder_status.connect(self.update_folder_status)
-        self.html_validation_thread.result.connect(self.display_internal_links_report)
-        self.html_validation_thread.start()
-
-    def validate_images(self):
-        if not self.html_path:
-            self.feedback_label.setFont(QFont("Helvetica", 12))
-            self.feedback_label.setText("Images Validation: No HTML file selected")
-            self.feedback_label.setVisible(True)
-            self.table.setVisible(False)
-            self.clear_content()
-            self.content_layout.addWidget(self.feedback_label, stretch=1)
-            return
-        self.validate_pdf_btn.setEnabled(False)
-        self.validate_html_btn.setEnabled(False)
-        self.back_btn.setEnabled(False)
-        self.feedback_label.setFont(QFont("Helvetica", 12))
-        self.feedback_label.setText("Images Validation: Processing...")
-        self.feedback_label.setVisible(True)
-        self.table.setVisible(False)
-        self.clear_content()
-        self.content_layout.addWidget(self.feedback_label, stretch=1)
-        self.html_validation_thread = HTMLValidationThread(self.html_path, "images")
-        self.html_validation_thread.progress.connect(self.update_html_progress)
-        self.html_validation_thread.folder_status.connect(self.update_folder_status)
-        self.html_validation_thread.result.connect(self.display_images_report)
-        self.html_validation_thread.start()
-
-    def update_html_progress(self, message):
-        current_time = time.time()
-        if current_time - self.last_progress_update < 0.5:
-            return
-        self.last_progress_update = current_time
-        self.feedback_label.setFont(QFont("Helvetica", 12))
-        self.feedback_label.setText(f"Validation: {message}")
-        self.feedback_label.setVisible(True)
-        self.table.setVisible(False)
-        self.clear_content()
-        self.content_layout.addWidget(self.feedback_label, stretch=1)
-        QApplication.processEvents()
-
-    def update_folder_status(self, folder_name, status):
-        current_time = datetime.now().strftime('%H:%M:%S')
-        status_text = f"{folder_name}: {status} ({current_time})"
-        self.feedback_label.setFont(QFont("Helvetica", 12))
-        self.feedback_label.setText(f"Validation: {status_text}")
-        self.feedback_label.setVisible(True)
-        self.table.setVisible(False)
-        self.clear_content()
-        self.content_layout.addWidget(self.feedback_label, stretch=1)
-        QApplication.processEvents()
-
-    def display_internal_links_report(self, html_report):
+    def display_html_report(self, html_report):
         self.clear_content()
         self.feedback_label.setFont(QFont("Helvetica", 12))
+        self.html_validation_thread = None
         if "error" in html_report:
-            self.feedback_label.setText(f"Internal Links Validation: {html_report['error']}")
+            self.feedback_label.setText(f"HTML Validation: {html_report['error']}")
+            self.feedback_label.setStyleSheet("color: #FFFFFF; background-color: transparent;")
+            self.feedback_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
             self.feedback_label.setVisible(True)
-            self.table.setVisible(False)
-            self.content_layout.addWidget(self.feedback_label, stretch=1)
-        elif "total_internal_links" in html_report:
-            total_links = html_report["total_internal_links"]
+            self.content_layout.addWidget(self.feedback_label, stretch=0)
+        else:
+            total_links = html_report.get("total_internal_links", 0)
             link_issues = html_report.get("link_issues", [])
-            self.feedback_label.setText(f"Internal Links Validation: {total_links} Internal Links Found Across All Files.")
-            self.feedback_label.setVisible(True)
-            self.content_layout.addWidget(self.feedback_label, stretch=0)
-            if not link_issues:
-                self.feedback_label.setText(self.feedback_label.text() + "\nAll internal links are valid.")
-                self.table.setVisible(False)
-                self.content_layout.addWidget(self.feedback_label, stretch=1)
-            else:
-                self.table.setRowCount(len(link_issues))
-                self.table.setColumnCount(4)
-                self.table.setHorizontalHeaderLabels(["File", "Href", "Location", "Issue"])
-                header = self.table.horizontalHeader()
-                header.setSectionResizeMode(0, QHeaderView.ResizeMode.Stretch)
-                header.setSectionResizeMode(1, QHeaderView.ResizeMode.Stretch)
-                header.setSectionResizeMode(2, QHeaderView.ResizeMode.Stretch)
-                header.setSectionResizeMode(3, QHeaderView.ResizeMode.ResizeToContents)
-                self.table.setWordWrap(True)
-                for row, issue in enumerate(link_issues):
-                    self.table.setItem(row, 0, QTableWidgetItem(os.path.basename(issue["file"])))
-                    self.table.setItem(row, 1, QTableWidgetItem(issue["href"]))
-                    self.table.setItem(row, 2, QTableWidgetItem(issue["location"]))
-                    self.table.setItem(row, 3, QTableWidgetItem(issue["issue"]))
-                self.table.resizeRowsToContents()
-                self.table.setVisible(True)
-                self.content_layout.addWidget(self.table, stretch=1)
-        self.validate_pdf_btn.setEnabled(True)
-        self.validate_html_btn.setEnabled(True)
-        self.back_btn.setEnabled(True)
-
-    def display_images_report(self, html_report):
-        self.clear_content()
-        self.feedback_label.setFont(QFont("Helvetica", 12))
-        if "error" in html_report:
-            self.feedback_label.setText(f"Images Validation: {html_report['error']}")
-            self.feedback_label.setVisible(True)
-            self.table.setVisible(False)
-            self.content_layout.addWidget(self.feedback_label, stretch=1)
-        elif "total_images" in html_report:
-            total_images = html_report["total_images"]
+            total_images = html_report.get("total_images", 0)
             image_issues = html_report.get("image_issues", [])
-            self.feedback_label.setText(f"Images Validation: {total_images} Images Found Across All Files.")
+            external_links = html_report.get("external_links", {})
+            total_external = external_links.get("total_external_links", 0)
+            self.feedback_label.setText(
+                f"HTML Validation: {total_links} Internal Links, {total_images} Images, {total_external} External Links Found Across All Files."
+            )
+            self.feedback_label.setStyleSheet("color: #FFFFFF; background-color: transparent;")
+            self.feedback_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
             self.feedback_label.setVisible(True)
             self.content_layout.addWidget(self.feedback_label, stretch=0)
-            if total_images == 0:
-                self.feedback_label.setText(self.feedback_label.text() + "\nNo images found. This could be because:\n- The HTML files do not contain any <img> tags or background-image CSS properties.\n- Images are embedded using other methods (e.g., JavaScript).\n- The linked files do not exist or are inaccessible.")
-                self.table.setVisible(False)
-                self.content_layout.addWidget(self.feedback_label, stretch=1)
-            elif not image_issues:
-                self.feedback_label.setText(self.feedback_label.text() + "\nAll images are accessible.")
-                self.table.setVisible(False)
-                self.content_layout.addWidget(self.feedback_label, stretch=1)
+
+            if total_images == 0 and not link_issues and not external_links:
+                self.feedback_label.setText(
+                    self.feedback_label.text() + "\nNo images or issues found. All internal links are valid.\nImages may be absent due to:\n- No <img> tags or background-image CSS properties.\n- Images embedded via JavaScript.\n- Inaccessible linked files."
+                )
+            elif not link_issues and not image_issues and not external_links.get("redirected") and not external_links.get("invalid") and not external_links.get("unreachable"):
+                self.feedback_label.setText(
+                    self.feedback_label.text() + "\nAll internal links, images, and external links are valid."
+                )
             else:
-                self.table.setRowCount(len(image_issues))
-                self.table.setColumnCount(4)
-                self.table.setHorizontalHeaderLabels(["File", "Src", "Location", "Issue"])
-                header = self.table.horizontalHeader()
-                header.setSectionResizeMode(0, QHeaderView.ResizeMode.Stretch)
-                header.setSectionResizeMode(1, QHeaderView.ResizeMode.Stretch)
-                header.setSectionResizeMode(2, QHeaderView.ResizeMode.Stretch)
-                header.setSectionResizeMode(3, QHeaderView.ResizeMode.ResizeToContents)
-                self.table.setWordWrap(True)
-                for row, issue in enumerate(image_issues):
-                    self.table.setItem(row, 0, QTableWidgetItem(os.path.basename(issue["file"])))
-                    self.table.setItem(row, 1, QTableWidgetItem(issue["src"]))
-                    self.table.setItem(row, 2, QTableWidgetItem(issue["location"]))
-                    self.table.setItem(row, 3, QTableWidgetItem(issue["issue"]))
-                self.table.resizeRowsToContents()
-                self.table.setVisible(True)
-                self.content_layout.addWidget(self.table, stretch=1)
+                issues = (
+                    [{"type": "Link", "file": issue["file"], "href": issue["href"], "location": issue["location"], "issue": issue["issue"]} for issue in link_issues] +
+                    [{"type": "Image", "file": issue["file"], "href": issue["src"], "location": issue["location"], "issue": issue["issue"]} for issue in image_issues]
+                )
+                if issues:
+                    internal_label = QLabel("Internal Link Validation Results:")
+                    internal_label.setFont(QFont("Helvetica", 12, QFont.Weight.Bold))
+                    internal_label.setStyleSheet("color: #FFFFFF; background-color: transparent;")
+                    self.content_layout.addWidget(internal_label, stretch=0)
+                    self.table.setRowCount(len(issues))
+                    self.table.setColumnCount(4)
+                    self.table.setHorizontalHeaderLabels(["Type", "File", "Href/Src", "Issue"])
+                    header = self.table.horizontalHeader()
+                    header.setSectionResizeMode(QHeaderView.ResizeMode.Stretch)
+                    self.table.setWordWrap(True)
+                    self.table.setColumnWidth(3, 200)
+                    base_dir = Path(self.html_path).parent if self.html_path else Path.cwd()
+                    for row, issue in enumerate(issues):
+                        self.table.setItem(row, 0, QTableWidgetItem(issue["type"]))
+                        file_item = QTableWidgetItem(os.path.basename(issue["file"]))
+                        file_font = QFont("Helvetica", 12)
+                        file_font.setUnderline(True)
+                        file_item.setFont(file_font)
+                        file_item.setForeground(QColor("#0D6E6E"))
+                        file_path = base_dir / issue["location"]
+                        try:
+                            resolved_path = str(file_path.resolve())
+                            file_url = QUrl.fromLocalFile(resolved_path).toString()
+                            file_item.setData(Qt.ItemDataRole.UserRole, file_url)
+                        except Exception:
+                            file_url = ""
+                            file_item.setData(Qt.ItemDataRole.UserRole, file_url)
+                        file_item.setFlags(Qt.ItemFlag.ItemIsSelectable | Qt.ItemFlag.ItemIsEnabled)
+                        file_item.setToolTip(f"Click to open: {file_path}")
+                        self.table.setItem(row, 1, file_item)
+                        href_item = QTableWidgetItem(issue["href"])
+                        href_item.setFlags(Qt.ItemFlag.ItemIsSelectable | Qt.ItemFlag.ItemIsEnabled)
+                        self.table.setItem(row, 2, href_item)
+                        issue_item = QTableWidgetItem(issue["issue"])
+                        issue_item.setFlags(Qt.ItemFlag.ItemIsSelectable | Qt.ItemFlag.ItemIsEnabled)
+                        self.table.setItem(row, 3, issue_item)
+                    self.table.resizeRowsToContents()
+                    self.table.cellClicked.connect(self.open_internal_url)
+                    self.table.setVisible(True)
+                    self.content_layout.addWidget(self.table, stretch=0)
+
+                if "error" in external_links:
+                    self.feedback_label.setText(self.feedback_label.text() + f"\nExternal Link Validation: {external_links['error']}")
+                else:
+                    external_issues = (
+                        external_links.get("redirected", []) +
+                        external_links.get("invalid", []) +
+                        external_links.get("unreachable", [])
+                    )
+                    if external_issues:
+                        external_label = QLabel("External Link Validation Results:")
+                        external_label.setFont(QFont("Helvetica", 12, QFont.Weight.Bold))
+                        external_label.setStyleSheet("color: #FFFFFF; background-color: transparent;")
+                        self.content_layout.addWidget(external_label, stretch=0)
+                        self.external_table.setRowCount(len(external_issues))
+                        self.external_table.setColumnCount(4)
+                        self.external_table.setHorizontalHeaderLabels(["File", "Link", "Redirector Link", "Status"])
+                        external_header = self.external_table.horizontalHeader()
+                        external_header.setSectionResizeMode(QHeaderView.ResizeMode.Stretch)
+                        self.external_table.setWordWrap(True)
+                        self.external_table.setColumnWidth(3, 200)
+                        base_dir = Path(self.html_path).parent if self.html_path else Path.cwd()
+                        for row, issue in enumerate(external_issues):
+                            file_item = QTableWidgetItem(", ".join(os.path.basename(f) for f in issue["files"]))
+                            file_font = QFont("Helvetica", 12)
+                            file_font.setUnderline(True)
+                            file_item.setFont(file_font)
+                            file_item.setForeground(QColor("#0D6E6E"))
+                            file_paths = [base_dir / f for f in issue["files"]]
+                            try:
+                                resolved_path = str(file_paths[0].resolve())
+                                file_url = QUrl.fromLocalFile(resolved_path).toString()
+                                file_item.setData(Qt.ItemDataRole.UserRole, file_url)
+                            except Exception:
+                                file_url = ""
+                                file_item.setData(Qt.ItemDataRole.UserRole, file_url)
+                            file_item.setFlags(Qt.ItemFlag.ItemIsSelectable | Qt.ItemFlag.ItemIsEnabled)
+                            file_item.setToolTip(f"Click to open: {file_paths[0]}")
+                            self.external_table.setItem(row, 0, file_item)
+                            link_item = QTableWidgetItem(issue["url"])
+                            link_font = QFont("Helvetica", 12)
+                            link_font.setUnderline(True)
+                            link_item.setFont(link_font)
+                            link_item.setForeground(QColor("#0D6E6E"))
+                            link_item.setData(Qt.ItemDataRole.UserRole, issue["url"])
+                            link_item.setFlags(Qt.ItemFlag.ItemIsSelectable | Qt.ItemFlag.ItemIsEnabled)
+                            link_item.setToolTip(f"Click to open: {issue['url']}")
+                            self.external_table.setItem(row, 1, link_item)
+                            redirector_item = QTableWidgetItem(issue.get("redirected_to", "N/A"))
+                            if issue.get("redirected_to"):
+                                redirector_font = QFont("Helvetica", 12)
+                                redirector_font.setUnderline(True)
+                                redirector_item.setFont(redirector_font)
+                                redirector_item.setForeground(QColor("#0D6E6E"))
+                                redirector_item.setData(Qt.ItemDataRole.UserRole, issue["redirected_to"])
+                                redirector_item.setFlags(Qt.ItemFlag.ItemIsSelectable | Qt.ItemFlag.ItemIsEnabled)
+                                redirector_item.setToolTip(f"Click to open: {issue['redirected_to']}")
+                            self.external_table.setItem(row, 2, redirector_item)
+                            status_item = QTableWidgetItem(issue["reason"])
+                            status_item.setFlags(Qt.ItemFlag.ItemIsSelectable | Qt.ItemFlag.ItemIsEnabled)
+                            self.external_table.setItem(row, 3, status_item)
+                        self.external_table.resizeRowsToContents()
+                        self.external_table.cellClicked.connect(self.open_external_url)
+                        self.external_table.setVisible(True)
+                        self.content_layout.addWidget(self.external_table, stretch=0)
         self.validate_pdf_btn.setEnabled(True)
         self.validate_html_btn.setEnabled(True)
         self.back_btn.setEnabled(True)
 
-    def open_url(self, row, column):
-        if column in (1, 2):
-            item = self.table.item(row, column)
-            if item:
-                url = item.data(Qt.ItemDataRole.UserRole)
-                if url and url != "N/A":
-                    QDesktopServices.openUrl(QUrl(url))
+    def open_internal_url(self, row, col):
+        if col != 1:  # Only "File" column (col=1) is clickable
+            return
+        item = self.table.item(row, col)
+        if item:
+            user_role_data = item.data(Qt.ItemDataRole.UserRole)
+            if user_role_data:
+                url = QUrl(user_role_data)
+                if url.isValid():
+                    QDesktopServices.openUrl(url)
+
+    def open_external_url(self, row, col):
+        if col not in [0, 1, 2]:  # Only "File" (col=0), "Link" (col=1), and "Redirector Link" (col=2) are clickable
+            return
+        item = self.external_table.item(row, col)
+        if item:
+            user_role_data = item.data(Qt.ItemDataRole.UserRole)
+            if user_role_data:
+                url = QUrl(user_role_data)
+                if url.isValid():
+                    QDesktopServices.openUrl(url)

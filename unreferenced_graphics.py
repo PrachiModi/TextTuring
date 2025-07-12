@@ -1,6 +1,7 @@
 import os
 from lxml import etree
 from urllib.parse import unquote
+import shutil
 
 def find_unreferenced_graphics(ditamap_path, directory_path):
     """
@@ -68,26 +69,66 @@ def find_unreferenced_graphics(ditamap_path, directory_path):
 
 def move_graphic_to_trash(full_path, directory_path):
     """
-    Move an unreferenced graphic file to the LegacyTextTuring folder within the selected directory.
+    Move an unreferenced graphic file to LegacyTextTuring/Graphics within the selected directory,
+    handling filename conflicts by appending a suffix. Log the move to LegacyTextTuring/Log.txt with a single header.
+    Skip if the file already exists in the destination with the same name and suffix.
     
     Args:
         full_path (str): Full path to the graphic file.
         directory_path (str): Root directory for relative path calculations.
     
     Raises:
-        Exception: If the file cannot be moved.
+        Exception: If the file cannot be moved or logged (except for existing files).
+    
+    Returns:
+        bool: True if operation succeeded or was skipped, False if logging failed.
     """
     if not os.path.exists(full_path):
         raise FileNotFoundError(f"Graphic file not found: {full_path}")
 
-    legacy_dir = os.path.join(directory_path, "LegacyTextTuring")
-    os.makedirs(legacy_dir, exist_ok=True)
-
-    file_name = os.path.basename(full_path)
-    destination = os.path.join(legacy_dir, file_name)
+    # Initialize LegacyTextTuring/Graphics directory and log file
+    legacy_graphics_dir = os.path.join(directory_path, "LegacyTextTuring", "Graphics")
+    log_file = os.path.join(directory_path, "LegacyTextTuring", "Log.txt")
+    log_success = True
+    # Track header globally within this module to ensure it's written only once per session
+    if not hasattr(move_graphic_to_trash, 'header_written'):
+        move_graphic_to_trash.header_written = False
 
     try:
-        import shutil
+        os.makedirs(legacy_graphics_dir, exist_ok=True)
+        if not os.path.exists(legacy_graphics_dir):
+            raise OSError(f"Failed to create {legacy_graphics_dir}")
+    except (OSError, PermissionError) as e:
+        log_success = False
+        raise Exception(f"Failed to create LegacyTextTuring/Graphics directory: {str(e)}")
+
+    # Calculate relative path for logging and destination path
+    rel_path = os.path.relpath(full_path, directory_path).replace(os.sep, "/")
+    file_name = os.path.basename(full_path)
+    base, ext = os.path.splitext(file_name)
+    destination = os.path.join(legacy_graphics_dir, file_name)
+
+    # Handle filename conflicts by appending a suffix
+    counter = 1
+    while os.path.exists(destination):
+        new_file_name = f"{base}_{counter}{ext}"
+        destination = os.path.join(legacy_graphics_dir, new_file_name)
+        counter += 1
+
+    try:
+        # Move the file
         shutil.move(full_path, destination)
+        # Log the move
+        try:
+            with open(log_file, 'a', encoding='utf-8') as f:
+                if not move_graphic_to_trash.header_written:
+                    f.write("-----------------------------\nDeleted Unreferenced Graphics\n")
+                    move_graphic_to_trash.header_written = True
+                f.write(f"{rel_path} - deleted\n")
+        except (OSError, PermissionError) as e:
+            log_success = False
+            raise Exception(f"Failed to write to log file {log_file}: {str(e)}")
     except Exception as e:
-        raise Exception(f"Failed to move graphic {file_name} to LegacyTextTuring: {str(e)}")
+        raise Exception(f"Failed to move graphic {file_name} to {destination}: {str(e)}")
+
+    return log_success

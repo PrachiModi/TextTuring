@@ -1,21 +1,23 @@
 import os
 from lxml import etree
+import re
 
 def validate_graphics(directory_path: str) -> list:
     """
     Scan all XML files in the given directory and its subfolders to validate <image> elements.
-    Returns images with issues (missing height, width, or figure title), omitting images with
-    height, width, and a non-empty figure title all set.
-    
+    Validates width (presence, unit, value), scope, scale, and figure title.
+    Returns images with issues, omitting images with valid width, scope, scale, and non-empty figure title.
+
     Args:
         directory_path: Path to the directory containing XML files.
-    
+
     Returns:
         list: List of tuples (relative_path, status, figure_title) for each image with issues.
-              relative_path is the path relative to directory_path, status is "Height not set",
-              "Width not set", "Height and Width not set", or "---" (if height and width are set),
-              figure_title is "---" if the parent <fig> has a non-empty <title>, or
-              "Missing Image Title" if <fig> is missing or <title> is absent/empty.
+              relative_path: Path relative to directory_path.
+              status: Concatenated issues ("Width not set", "Invalid width format", 
+                      "Width set to [value][unit], invalid unit", "Width more than 6.75in",
+                      "Invalid external scope", "Remove Image scale").
+              figure_title: "---" if parent <fig> has non-empty <title>, else "Missing Image Title".
     """
     results = []
 
@@ -30,18 +32,39 @@ def validate_graphics(directory_path: str) -> list:
                     # Find all <image> elements
                     images = tree.xpath("//image")
                     for image in images:
-                        # Check for height and width attributes
-                        height = image.get("height")
+                        # Initialize status list for concatenation
+                        status_parts = []
+
+                        # Check width attribute
                         width = image.get("width")
-                        status = ""
-                        if not height and not width:
-                            status = "Height and Width not set"
-                        elif not height:
-                            status = "Height not set"
-                        elif not width:
-                            status = "Width not set"
+                        if not width:
+                            status_parts.append("Width not set")
                         else:
-                            status = "---"
+                            # Parse width for value and unit
+                            width_match = re.match(r"^(\d*\.?\d+)([a-zA-Z*]+)?$", width)
+                            if not width_match:
+                                status_parts.append("Invalid width format")
+                            else:
+                                value_str, unit = width_match.groups()
+                                unit = unit or ""  # Handle cases where unit is missing
+                                try:
+                                    width_value = float(value_str)
+                                    if unit != "in":
+                                        status_parts.append(f"Width set to {width}{unit}, invalid unit")
+                                    elif width_value > 6.75:
+                                        status_parts.append("Width more than 6.75in")
+                                except ValueError:
+                                    status_parts.append("Invalid width format")
+
+                        # Check scope attribute
+                        scope = image.get("scope")
+                        if scope == "external":
+                            status_parts.append("Invalid external scope")
+
+                        # Check scale attribute
+                        scale = image.get("scale")
+                        if scale and scale.strip():
+                            status_parts.append("Remove Image scale")
 
                         # Check for parent <fig> and its <title>
                         parent_fig = image.xpath("parent::fig")
@@ -53,11 +76,14 @@ def validate_graphics(directory_path: str) -> list:
                                 figure_title = "---"
                                 has_valid_title = True
 
-                        # Skip images with height, width, and non-empty title all set
-                        if status == "---" and has_valid_title:
+                        # Skip images with no issues
+                        if not status_parts and has_valid_title:
                             continue
 
-                        # Compute the relative path from directory_path to file_path
+                        # Combine status messages
+                        status = "; ".join(status_parts) if status_parts else "---"
+
+                        # Compute relative path
                         relative_path = os.path.relpath(file_path, directory_path)
                         results.append((relative_path, status, figure_title))
                 except etree.LxmlError:
