@@ -198,7 +198,7 @@ class ValidateXMLsWidget(QWidget):
         validate_chapter_toc_icon_container.setFixedHeight(40)
         validate_chapter_toc_icon_layout = QHBoxLayout()
         validate_chapter_toc_icon_container.setLayout(validate_chapter_toc_icon_layout)
-        validate_chapter_toc_icon_container.setStyleSheet("background-color: #1F252A;")
+        validate_chapter_toc_icon_container.setStyleSheet("background-color: transparent;")
         validate_chapter_toc_info_label = QLabel()
         validate_chapter_toc_info_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
         if os.path.exists(icon_path):

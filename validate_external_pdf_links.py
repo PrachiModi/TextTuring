@@ -6,64 +6,79 @@ import httpx
 from urllib.parse import unquote
 import time
 import logging
-from multiprocessing import Pool
-from functools import partial
+from collections import defaultdict, Counter
 
-# Set up logging to a file
+# Debug: Print environment details
+print(f"validate_external_pdf_links.py: Python executable: {sys.executable}")
+try:
+    import fitz
+    print(f"validate_external_pdf_links.py: PyMuPDF version: {fitz.__version__}")
+except ImportError as e:
+    print(f"validate_external_pdf_links.py: ImportError: {str(e)}", file=sys.stderr)
+
+# Set up logging
 logging.basicConfig(
-    level=logging.INFO,
+    level=logging.DEBUG,
     format='%(asctime)s - %(levelname)s - [%(funcName)s:%(lineno)d] - %(message)s',
     handlers=[logging.FileHandler('validation.log', mode='a')]
 )
 logger = logging.getLogger(__name__)
 
-CONCURRENT_LIMIT = 100
+CONCURRENT_LIMIT = 200
 TIMEOUT = 10
 URL_CACHE = {}
 
-def process_page(page_num, pdf_path):
+def process_page(page_num, pdf_path, total_pages):
     """Process a single PDF page to extract external and mailto links."""
+    logger.debug(f"Processing page {page_num + 1}/{total_pages}")
     try:
         doc = fitz.open(pdf_path)
         page = doc[page_num]
         page_label = page.get_label() or str(page_num + 1)
-        external_links = {}
-        mailto_links = {}
+        external_links = defaultdict(int)
+        mailto_links = defaultdict(int)
         for link in page.get_links():
             uri = link.get("uri")
             if uri:
                 uri = unquote(uri)
+                rect = link["from"]
+                text = page.get_textbox(rect).strip()
                 if uri.startswith("mailto:"):
-                    mailto_links.setdefault(uri, []).append(page_label)
+                    mailto_links[uri] += 1
                 elif uri.startswith(("http:", "https:")):
-                    external_links.setdefault(uri, []).append(page_label)
+                    external_links[uri] += 1
+                count_str = f" ({external_links[uri] or mailto_links[uri]})" if (external_links[uri] or mailto_links[uri]) > 1 else ""
+                logger.debug(f"Page {page_label}{count_str}: Link URI: {uri}, Text: {text}")
+        external_links_page = {uri: (page_label, count) for uri, count in external_links.items()}
+        mailto_links_page = {uri: (page_label, count) for uri, count in mailto_links.items()}
         doc.close()
-        return external_links, mailto_links
+        print(f"Progress: Processing page ({page_num + 1}/{total_pages})", flush=True)
+        return external_links_page, mailto_links_page
     except Exception as e:
         logger.error(f"Error processing page {page_num + 1}: {str(e)}")
         return {}, {}
 
 def extract_links(doc):
-    """Extract external and mailto hyperlinks from the PDF using multiprocessing."""
-    logger.info("Starting link extraction")
-    external_links = {}
-    mailto_links = {}
+    """Extract external and mailto hyperlinks from the PDF sequentially."""
+    logger.debug("Starting link extraction")
+    external_links = defaultdict(Counter)
+    mailto_links = defaultdict(Counter)
     try:
         total_pages = len(doc)
-        with Pool() as pool:
-            results = pool.map(partial(process_page, pdf_path=doc.name), range(total_pages))
-        for ext_links, mail_links in results:
-            for uri, pages in ext_links.items():
-                external_links.setdefault(uri, []).extend(pages)
-            for uri, pages in mail_links.items():
-                mailto_links.setdefault(uri, []).extend(pages)
-        logger.info(f"Extracted {len(external_links)} external links and {len(mailto_links)} mailto links")
+        for i in range(total_pages):
+            ext, mail = process_page(i, doc.name, total_pages)
+            for uri, (page, count) in ext.items():
+                external_links[uri][page] += count
+            for uri, (page, count) in mail.items():
+                mailto_links[uri][page] += count
+            sys.stdout.flush()
+        logger.debug(f"Extracted {len(external_links)} external links and {len(mailto_links)} mailto links")
     except Exception as e:
         logger.error(f"Error extracting hyperlinks: {str(e)}")
         print(f"Error extracting hyperlinks: {str(e)}", file=sys.stderr)
     return external_links, mailto_links
 
-async def check_link_validity(url, pages, client, sem):
+async def check_link_validity(url, pages_counts, client, sem):
     """Check if an external hyperlink is valid, with retries and GET fallback."""
     logger.debug(f"Checking URL: {url}")
     if url in URL_CACHE:
@@ -73,7 +88,7 @@ async def check_link_validity(url, pages, client, sem):
     async with sem:
         headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"}
         attempts = 0
-        max_attempts = 3
+        max_attempts = 1
         while attempts < max_attempts:
             attempts += 1
             try:
@@ -84,15 +99,15 @@ async def check_link_validity(url, pages, client, sem):
                 
                 if response.status_code in (301, 302):
                     redirected_url = response.headers.get("Location", "")
-                    result = ({"url": url, "pages": pages, "reason": f"Redirected, Status: {response.status_code}", "redirected_to": redirected_url}, "redirected")
+                    result = ({"url": url, "pages_counts": dict(pages_counts), "reason": f"Redirected, Status: {response.status_code}", "redirected_to": redirected_url}, "redirected")
                     URL_CACHE[url] = result
                     return result
                 elif response.status_code >= 400:
-                    result = ({"url": url, "pages": pages, "reason": f"Status: {response.status_code}"}, "invalid")
+                    result = ({"url": url, "pages_counts": dict(pages_counts), "reason": f"Status: {response.status_code}"}, "invalid")
                     URL_CACHE[url] = result
                     return result
                 else:
-                    result = ({"url": url, "pages": pages, "reason": f"Valid, Status: {response.status_code}"}, "valid")
+                    result = ({"url": url, "pages_counts": dict(pages_counts), "reason": f"Valid, Status: {response.status_code}"}, "valid")
                     URL_CACHE[url] = result
                     return result
             
@@ -107,31 +122,31 @@ async def check_link_validity(url, pages, client, sem):
                         
                         if response.status_code in (301, 302):
                             redirected_url = response.headers.get("Location", "")
-                            result = ({"url": url, "pages": pages, "reason": f"Redirected, Status: {response.status_code}", "redirected_to": redirected_url}, "redirected")
+                            result = ({"url": url, "pages_counts": dict(pages_counts), "reason": f"Redirected, Status: {response.status_code}", "redirected_to": redirected_url}, "redirected")
                             URL_CACHE[url] = result
                             return result
                         elif response.status_code >= 400:
-                            result = ({"url": url, "pages": pages, "reason": f"Status: {response.status_code}"}, "invalid")
+                            result = ({"url": url, "pages_counts": dict(pages_counts), "reason": f"Status: {response.status_code}"}, "invalid")
                             URL_CACHE[url] = result
                             return result
                         else:
-                            result = ({"url": url, "pages": pages, "reason": f"Valid, Status: {response.status_code}"}, "valid")
+                            result = ({"url": url, "pages_counts": dict(pages_counts), "reason": f"Valid, Status: {response.status_code}"}, "valid")
                             URL_CACHE[url] = result
                             return result
                     except httpx.TimeoutException:
                         logger.debug(f"URL={url}, Attempt={attempts}, Method=GET, Timeout after {TIMEOUT}s")
-                        result = ({"url": url, "pages": pages, "reason": f"Timeout after {TIMEOUT}s"}, "unreachable")
+                        result = ({"url": url, "pages_counts": dict(pages_counts), "reason": f"Timeout after {TIMEOUT}s"}, "unreachable")
                         URL_CACHE[url] = result
                         return result
                     except Exception as e:
                         logger.debug(f"URL={url}, Attempt={attempts}, Method=GET, Error={str(e)}")
-                        result = ({"url": url, "pages": pages, "reason": f"Error: {str(e)}"}, "unreachable")
+                        result = ({"url": url, "pages_counts": dict(pages_counts), "reason": f"Error: {str(e)}"}, "unreachable")
                         URL_CACHE[url] = result
                         return result
             except Exception as e:
                 if attempts == max_attempts:
                     logger.debug(f"URL={url}, Attempt={attempts}, Method=HEAD, Error={str(e)}")
-                    result = ({"url": url, "pages": pages, "reason": f"Error: {str(e)}"}, "unreachable")
+                    result = ({"url": url, "pages_counts": dict(pages_counts), "reason": f"Error: {str(e)}"}, "unreachable")
                     URL_CACHE[url] = result
                     return result
                 logger.debug(f"URL={url}, Attempt={attempts}, Method=HEAD, Retrying due to {str(e)}")
@@ -139,43 +154,46 @@ async def check_link_validity(url, pages, client, sem):
 
 async def validate_all_links(external_links):
     """Validate all unique external links concurrently."""
-    logger.info(f"Starting validation of {len(external_links)} unique URLs")
+    logger.debug(f"Starting validation of {len(external_links)} unique URLs")
     invalid_links = []
     redirected_links = []
     unreachable_links = []
     valid_links = []
     unique_urls = list(external_links.keys())
+    batch_size = 50
 
     sem = asyncio.Semaphore(CONCURRENT_LIMIT)
     async with httpx.AsyncClient() as client:
-        tasks = []
-        for url in unique_urls:
-            tasks.append(check_link_validity(url, external_links[url], client, sem))
+        for i in range(0, len(unique_urls), batch_size):
+            batch_urls = unique_urls[i:i + batch_size]
+            tasks = []
+            for url in batch_urls:
+                tasks.append(check_link_validity(url, external_links[url], client, sem))
 
-        try:
-            results = await asyncio.gather(*tasks, return_exceptions=True)
-            for result in results:
-                if isinstance(result, Exception):
-                    logger.error(f"Validation error: {str(result)}")
-                    continue
-                
-                link_info, category = result
-                logger.debug(f"URL={link_info['url']}, Category={category}, Reason={link_info['reason']}")
-                if category == "redirected":
-                    redirected_links.append(link_info)
-                elif category == "invalid":
-                    invalid_links.append(link_info)
-                elif category == "unreachable":
-                    unreachable_links.append(link_info)
-                elif category == "valid":
-                    valid_links.append(link_info)
+            try:
+                results = await asyncio.gather(*tasks, return_exceptions=True)
+                for result in results:
+                    if isinstance(result, Exception):
+                        logger.error(f"Validation error: {str(result)}")
+                        continue
+                    
+                    link_info, category = result
+                    logger.debug(f"URL={link_info['url']}, Category={category}, Reason={link_info['reason']}")
+                    if category == "redirected":
+                        redirected_links.append(link_info)
+                    elif category == "invalid":
+                        invalid_links.append(link_info)
+                    elif category == "unreachable":
+                        unreachable_links.append(link_info)
+                    elif category == "valid":
+                        valid_links.append(link_info)
+                print(f"Progress: Validated {i + len(batch_urls)}/{len(unique_urls)} URLs", flush=True)
+            except Exception as e:
+                logger.error(f"Validation error: {str(e)}")
 
-        except Exception as e:
-            logger.error(f"Validation error: {str(e)}")
-
-    logger.info(f"Validation complete: Valid={len(valid_links)}, Redirected={len(redirected_links)}, Invalid={len(invalid_links)}, Unreachable={len(unreachable_links)}")
+    logger.debug(f"Validation complete: Valid={len(valid_links)}, Redirected={len(redirected_links)}, Invalid={len(invalid_links)}, Unreachable={len(unreachable_links)}")
     return {
-        "total_links": sum(len(pages) for pages in external_links.values()),
+        "total_links": sum(sum(counter.values()) for counter in external_links.values()),
         "redirected": redirected_links,
         "invalid": invalid_links,
         "unreachable": unreachable_links
@@ -183,12 +201,12 @@ async def validate_all_links(external_links):
 
 def main(pdf_path):
     """Main function to validate external PDF links and collect mailto links."""
-    logger.info(f"Starting PDF link validation for {pdf_path}")
+    logger.debug(f"Starting PDF link validation for {pdf_path}")
     result = {}
     try:
         doc = fitz.open(pdf_path)
         external_links, mailto_links = extract_links(doc)
-        total_mailto_links = sum(len(pages) for pages in mailto_links.values())
+        total_mailto_links = sum(sum(counter.values()) for counter in mailto_links.values())
         if external_links:
             external_result = asyncio.run(validate_all_links(external_links))
         else:
@@ -198,7 +216,7 @@ def main(pdf_path):
             "redirected": external_result["redirected"],
             "invalid": external_result["invalid"],
             "unreachable": external_result["unreachable"],
-            "mailto_count": len(mailto_links)  # Report number of unique mailto links
+            "mailto_count": len(mailto_links)
         }
     except Exception as e:
         logger.error(f"Validation error: {str(e)}")
@@ -208,11 +226,11 @@ def main(pdf_path):
             doc.close()
     print(json.dumps({"result": result}, ensure_ascii=False), file=sys.stdout)
     sys.stdout.flush()
-    logger.info(f"Completed PDF link validation for {pdf_path}")
+    logger.debug(f"Completed PDF link validation for {pdf_path}")
 
 if __name__ == "__main__":
     if len(sys.argv) != 2:
-        error_msg = "Usage: python verify_external_pdf_links.py <pdf_path>"
+        error_msg = "Usage: python validate_external_pdf_links.py <pdf_path>"
         logger.error(error_msg)
         print(json.dumps({"error": error_msg}, ensure_ascii=False), file=sys.stderr)
         sys.exit(1)
