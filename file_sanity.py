@@ -1,4 +1,4 @@
-from PyQt6.QtWidgets import QDialog, QVBoxLayout, QHBoxLayout, QPushButton, QTableWidget, QTableWidgetItem, QLabel, QFileDialog, QWidget
+from PyQt6.QtWidgets import QDialog, QVBoxLayout, QHBoxLayout, QPushButton, QTableWidget, QTableWidgetItem, QLabel, QFileDialog, QWidget, QMessageBox
 from PyQt6.QtCore import Qt, QUrl, QEvent
 from PyQt6.QtGui import QFont, QDesktopServices, QPalette, QColor, QPixmap
 from file_numbers import analyze_files, get_files_by_type, move_file_to_trash
@@ -11,6 +11,7 @@ import shutil
 from datetime import datetime
 import logging
 from markdown_viewer import MarkdownViewer
+from network_utils import get_network_drive_info
 
 # Set up logging
 logging.basicConfig(level=logging.DEBUG, format='%(asctime)s - %(levelname)s - %(message)s')
@@ -26,17 +27,14 @@ class FileListDialog(QDialog):
         self.file_type = file_type
         self.parent_widget = parent  # Reference to FileSanityWidget
         self.is_deleting = False
-
         self.setAutoFillBackground(True)
         palette = self.palette()
         palette.setColor(QPalette.ColorRole.Base, QColor("#1F252A"))
         self.setPalette(palette)
-
         layout = QVBoxLayout()
         layout.setContentsMargins(15, 15, 15, 15)
         layout.setSpacing(10)
         self.setLayout(layout)
-
         self.table = QTableWidget()
         self.table.setColumnCount(3)
         self.table.setHorizontalHeaderLabels(["File Name", "Folder Path", "Delete Button"])
@@ -46,20 +44,17 @@ class FileListDialog(QDialog):
         self.table.setFont(QFont("Helvetica", 10))
         self.table.setAlternatingRowColors(True)
         layout.addWidget(self.table, stretch=1)
-
         header = self.table.horizontalHeader()
         header.setSectionResizeMode(0, header.ResizeMode.Stretch)
         header.setSectionResizeMode(1, header.ResizeMode.Stretch)
         header.setSectionResizeMode(2, header.ResizeMode.Fixed)
         self.table.setColumnWidth(2, 110)
         self.table.verticalHeader().setDefaultSectionSize(30)
-
         self.feedback_label = QLabel("")
         self.feedback_label.setFont(QFont("Helvetica", 12))
         self.feedback_label.setStyleSheet("color: #121416; background-color: transparent;")
         self.feedback_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
         layout.addWidget(self.feedback_label)
-
         self.bottom_panel = QHBoxLayout()
         self.delete_all_btn = QPushButton("Delete All")
         self.delete_all_btn.setFont(QFont("Helvetica", 12, QFont.Weight.Medium))
@@ -91,7 +86,6 @@ class FileListDialog(QDialog):
         self.bottom_panel.addWidget(self.delete_all_btn)
         self.bottom_panel.addWidget(self.back_btn)
         layout.addLayout(self.bottom_panel)
-
         self.setStyleSheet("""
             QDialog {
                 background-color: #1F252A;
@@ -129,10 +123,8 @@ class FileListDialog(QDialog):
                 background-color: #E6ECEF;
             }
         """)
-
         self.delete_all_btn.clicked.connect(self.handle_delete_all)
         self.back_btn.clicked.connect(self.accept)
-
         self.populate_table()
 
     def populate_table(self):
@@ -214,13 +206,20 @@ class FileListDialog(QDialog):
         full_path = os.path.join(self.directory_path, folder_path, file_name)
         try:
             move_file_to_trash(full_path, self.directory_path)
-            self.table.removeRow(row)
+            self.table.removeRow(row)  # Remove only the deleted row
             remaining = self.table.rowCount()
             self.feedback_label.setText(f"Moved {file_name} to LegacyTextTuring. {remaining} files remaining.")
-            self.populate_table()
             if remaining == 0:
                 self.delete_all_btn.setEnabled(False)
+                self.table.setRowCount(1)
+                self.table.setItem(0, 0, QTableWidgetItem("No files"))
+                self.table.setItem(0, 1, QTableWidgetItem(""))
+                self.table.setItem(0, 2, QTableWidgetItem(""))
+            self.table.viewport().update()  # Force UI redraw
             self.logger.debug(f"Moved {file_name} to LegacyTextTuring, {remaining} files remaining")
+            # Notify parent to refresh its table
+            if self.parent_widget and self.parent_widget.current_mode == "file_analytics":
+                self.parent_widget.refresh_table()
         except Exception as e:
             self.feedback_label.setText(f"Failed to move {file_name} to LegacyTextTuring: {str(e)}")
             self.logger.error(f"Failed to move {full_path} to LegacyTextTuring: {str(e)}")
@@ -258,60 +257,57 @@ class FileListDialog(QDialog):
             self.logger.debug(f"Successfully moved all {moved_count} {self.file_type} files to LegacyTextTuring")
 
     def accept(self):
-        self.logger.debug("Accepting FileListDialog, refreshing parent")
+        self.logger.debug("Accepting FileListDialog, resetting parent")
         if self.parent_widget:
+            self.parent_widget.directory_path = ""
+            self.parent_widget.current_mode = ""
             self.parent_widget.refresh_table()
         super().accept()
 
 class FileSanityWidget(QWidget):
     def __init__(self, parent=None):
         super().__init__(parent)
-        self.parent_window = parent  # Reference to main window
+        self.parent_window = parent
         self.logger = logging.getLogger(__name__)
         self.directory_path = ""
         self.selected_ditamap = ""
         self.delete_unnecessary_dir = ""
         self.is_deleting = False
         self.current_mode = ""
-        self.button_info_labels = {}  # Store info labels for buttons
-        self.markdown_viewers = []  # Track Markdown viewers
-
+        self.button_info_labels = {}
+        self.markdown_viewers = []
         self.setAutoFillBackground(True)
         palette = self.palette()
         palette.setColor(QPalette.ColorRole.Base, QColor("#1F252A"))
         self.setPalette(palette)
-
         layout = QVBoxLayout()
         layout.setContentsMargins(15, 15, 15, 15)
-        layout.setSpacing(10)  # Increased spacing
+        layout.setSpacing(10)
         self.setLayout(layout)
-
         button_panel = QHBoxLayout()
         button_panel.setContentsMargins(0, 0, 0, 0)
         button_panel.setSpacing(8)
-
-        # File Analytics section
         file_analytics_layout = QVBoxLayout()
-        file_analytics_layout.setSpacing(10)  # Increased spacing
+        file_analytics_layout.setSpacing(10)
         file_analytics_icon_container = QWidget()
-        file_analytics_icon_container.setFixedHeight(30)  # Increased height
+        file_analytics_icon_container.setFixedHeight(30)
         file_analytics_icon_layout = QHBoxLayout()
         file_analytics_icon_container.setLayout(file_analytics_icon_layout)
-        file_analytics_icon_container.setStyleSheet("background-color: transparent; margin-top: 2px;")  # Added top margin
+        file_analytics_icon_container.setStyleSheet("background-color: transparent; margin-top: 2px;")
         file_analytics_info_label = QLabel()
-        file_analytics_info_label.setAlignment(Qt.AlignmentFlag.AlignCenter)  # Center the icon
-        file_analytics_info_label.setFixedSize(16, 16)  # Fixed size for icon
+        file_analytics_info_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        file_analytics_info_label.setFixedSize(16, 16)
         icon_path = os.path.join(os.path.dirname(__file__), "icon.png")
         if os.path.exists(icon_path):
             pixmap = QPixmap(icon_path).scaled(16, 16, Qt.AspectRatioMode.KeepAspectRatio)
             file_analytics_info_label.setPixmap(pixmap)
-            file_analytics_info_label.update()  # Force repaint
+            file_analytics_info_label.update()
         else:
             pixmap = QPixmap(16, 16)
             pixmap.fill(Qt.GlobalColor.transparent)
             file_analytics_info_label.setPixmap(pixmap)
         file_analytics_info_label.setCursor(Qt.CursorShape.PointingHandCursor)
-        file_analytics_info_label.setVisible(True)  # Default visible
+        file_analytics_info_label.setVisible(True)
         file_analytics_info_label.mousePressEvent = lambda event: self.open_markdown_help("File Analytics")
         self.button_info_labels["File Analytics"] = file_analytics_info_label
         file_analytics_icon_layout.addWidget(file_analytics_info_label)
@@ -322,28 +318,26 @@ class FileSanityWidget(QWidget):
         file_analytics_layout.addWidget(file_analytics_icon_container)
         file_analytics_layout.addWidget(self.file_analytics_btn)
         button_panel.addLayout(file_analytics_layout)
-
-        # Delete Unnecessary Folders section
         delete_unnecessary_layout = QVBoxLayout()
-        delete_unnecessary_layout.setSpacing(10)  # Increased spacing
+        delete_unnecessary_layout.setSpacing(10)
         delete_unnecessary_icon_container = QWidget()
-        delete_unnecessary_icon_container.setFixedHeight(30)  # Increased height
+        delete_unnecessary_icon_container.setFixedHeight(30)
         delete_unnecessary_icon_layout = QHBoxLayout()
         delete_unnecessary_icon_container.setLayout(delete_unnecessary_icon_layout)
-        delete_unnecessary_icon_container.setStyleSheet("background-color: transparent; margin-top: 2px;")  # Added top margin
+        delete_unnecessary_icon_container.setStyleSheet("background-color: transparent; margin-top: 2px;")
         delete_unnecessary_info_label = QLabel()
-        delete_unnecessary_info_label.setAlignment(Qt.AlignmentFlag.AlignCenter)  # Center the icon
-        delete_unnecessary_info_label.setFixedSize(16, 16)  # Fixed size for icon
+        delete_unnecessary_info_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        delete_unnecessary_info_label.setFixedSize(16, 16)
         if os.path.exists(icon_path):
             pixmap = QPixmap(icon_path).scaled(16, 16, Qt.AspectRatioMode.KeepAspectRatio)
             delete_unnecessary_info_label.setPixmap(pixmap)
-            delete_unnecessary_info_label.update()  # Force repaint
+            delete_unnecessary_info_label.update()
         else:
             pixmap = QPixmap(16, 16)
             pixmap.fill(Qt.GlobalColor.transparent)
             delete_unnecessary_info_label.setPixmap(pixmap)
         delete_unnecessary_info_label.setCursor(Qt.CursorShape.PointingHandCursor)
-        delete_unnecessary_info_label.setVisible(True)  # Default visible
+        delete_unnecessary_info_label.setVisible(True)
         delete_unnecessary_info_label.mousePressEvent = lambda event: self.open_markdown_help("Delete Unnecessary Folders")
         self.button_info_labels["Delete Unnecessary Folders"] = delete_unnecessary_info_label
         delete_unnecessary_icon_layout.addWidget(delete_unnecessary_info_label)
@@ -354,28 +348,26 @@ class FileSanityWidget(QWidget):
         delete_unnecessary_layout.addWidget(delete_unnecessary_icon_container)
         delete_unnecessary_layout.addWidget(self.delete_unnecessary_btn)
         button_panel.addLayout(delete_unnecessary_layout)
-
-        # Check Unreferenced XMLs section
         check_unreferenced_layout = QVBoxLayout()
-        check_unreferenced_layout.setSpacing(10)  # Increased spacing
+        check_unreferenced_layout.setSpacing(10)
         check_unreferenced_icon_container = QWidget()
-        check_unreferenced_icon_container.setFixedHeight(30)  # Increased height
+        check_unreferenced_icon_container.setFixedHeight(30)
         check_unreferenced_icon_layout = QHBoxLayout()
         check_unreferenced_icon_container.setLayout(check_unreferenced_icon_layout)
-        check_unreferenced_icon_container.setStyleSheet("background-color: transparent; margin-top: 2px;")  # Added top margin
+        check_unreferenced_icon_container.setStyleSheet("background-color: transparent; margin-top: 2px;")
         check_unreferenced_info_label = QLabel()
-        check_unreferenced_info_label.setAlignment(Qt.AlignmentFlag.AlignCenter)  # Center the icon
-        check_unreferenced_info_label.setFixedSize(16, 16)  # Fixed size for icon
+        check_unreferenced_info_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        check_unreferenced_info_label.setFixedSize(16, 16)
         if os.path.exists(icon_path):
             pixmap = QPixmap(icon_path).scaled(16, 16, Qt.AspectRatioMode.KeepAspectRatio)
             check_unreferenced_info_label.setPixmap(pixmap)
-            check_unreferenced_info_label.update()  # Force repaint
+            check_unreferenced_info_label.update()
         else:
             pixmap = QPixmap(16, 16)
             pixmap.fill(Qt.GlobalColor.transparent)
             check_unreferenced_info_label.setPixmap(pixmap)
         check_unreferenced_info_label.setCursor(Qt.CursorShape.PointingHandCursor)
-        check_unreferenced_info_label.setVisible(True)  # Default visible
+        check_unreferenced_info_label.setVisible(True)
         check_unreferenced_info_label.mousePressEvent = lambda event: self.open_markdown_help("Check Unreferenced XMLs")
         self.button_info_labels["Check Unreferenced XMLs"] = check_unreferenced_info_label
         check_unreferenced_icon_layout.addWidget(check_unreferenced_info_label)
@@ -386,28 +378,26 @@ class FileSanityWidget(QWidget):
         check_unreferenced_layout.addWidget(check_unreferenced_icon_container)
         check_unreferenced_layout.addWidget(self.check_unreferenced_btn)
         button_panel.addLayout(check_unreferenced_layout)
-
-        # Check Unreferenced Graphics section
         check_unreferenced_graphics_layout = QVBoxLayout()
-        check_unreferenced_graphics_layout.setSpacing(10)  # Increased spacing
+        check_unreferenced_graphics_layout.setSpacing(10)
         check_unreferenced_graphics_icon_container = QWidget()
-        check_unreferenced_graphics_icon_container.setFixedHeight(30)  # Increased height
+        check_unreferenced_graphics_icon_container.setFixedHeight(30)
         check_unreferenced_graphics_icon_layout = QHBoxLayout()
         check_unreferenced_graphics_icon_container.setLayout(check_unreferenced_graphics_icon_layout)
-        check_unreferenced_graphics_icon_container.setStyleSheet("background-color: transparent; margin-top: 2px;")  # Added top margin
+        check_unreferenced_graphics_icon_container.setStyleSheet("background-color: transparent; margin-top: 2px;")
         check_unreferenced_graphics_info_label = QLabel()
-        check_unreferenced_graphics_info_label.setAlignment(Qt.AlignmentFlag.AlignCenter)  # Center the icon
-        check_unreferenced_graphics_info_label.setFixedSize(16, 16)  # Fixed size for icon
+        check_unreferenced_graphics_info_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        check_unreferenced_graphics_info_label.setFixedSize(16, 16)
         if os.path.exists(icon_path):
             pixmap = QPixmap(icon_path).scaled(16, 16, Qt.AspectRatioMode.KeepAspectRatio)
             check_unreferenced_graphics_info_label.setPixmap(pixmap)
-            check_unreferenced_graphics_info_label.update()  # Force repaint
+            check_unreferenced_graphics_info_label.update()
         else:
             pixmap = QPixmap(16, 16)
             pixmap.fill(Qt.GlobalColor.transparent)
             check_unreferenced_graphics_info_label.setPixmap(pixmap)
         check_unreferenced_graphics_info_label.setCursor(Qt.CursorShape.PointingHandCursor)
-        check_unreferenced_graphics_info_label.setVisible(True)  # Default visible
+        check_unreferenced_graphics_info_label.setVisible(True)
         check_unreferenced_graphics_info_label.mousePressEvent = lambda event: self.open_markdown_help("Check Unreferenced Graphics")
         self.button_info_labels["Check Unreferenced Graphics"] = check_unreferenced_graphics_info_label
         check_unreferenced_graphics_icon_layout.addWidget(check_unreferenced_graphics_info_label)
@@ -418,15 +408,12 @@ class FileSanityWidget(QWidget):
         check_unreferenced_graphics_layout.addWidget(check_unreferenced_graphics_icon_container)
         check_unreferenced_graphics_layout.addWidget(self.check_unreferenced_graphics_btn)
         button_panel.addLayout(check_unreferenced_graphics_layout)
-
         layout.addLayout(button_panel)
-
         self.feedback_label = QLabel("Select a check to begin")
         self.feedback_label.setFont(QFont("Helvetica", 14, QFont.Weight.Medium))
-        self.feedback_label.setStyleSheet("color: #FFFFFF; background-color: transparent;")  # Changed text color to white
+        self.feedback_label.setStyleSheet("color: #FFFFFF; background-color: transparent;")
         self.feedback_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
         layout.addWidget(self.feedback_label)
-
         self.table = QTableWidget()
         self.table.setColumnCount(3)
         self.table.setHorizontalHeaderLabels(["File Type", "No. of Files", "Action"])
@@ -444,7 +431,6 @@ class FileSanityWidget(QWidget):
         self.table.setColumnWidth(2, 110)
         self.table.verticalHeader().setDefaultSectionSize(30)
         layout.addWidget(self.table, stretch=1)
-
         self.bottom_panel = QHBoxLayout()
         self.delete_all_btn = QPushButton("Delete All")
         self.delete_all_btn.setFont(QFont("Helvetica", 12, QFont.Weight.Medium))
@@ -477,7 +463,6 @@ class FileSanityWidget(QWidget):
         self.bottom_panel.addWidget(self.delete_all_btn)
         self.bottom_panel.addWidget(self.back_btn)
         layout.addLayout(self.bottom_panel)
-
         self.setStyleSheet("""
             QWidget {
                 background-color: #1F252A;
@@ -515,7 +500,6 @@ class FileSanityWidget(QWidget):
                 background-color: #E6ECEF;
             }
         """)
-
         self.file_analytics_btn.clicked.connect(self.handle_file_analytics)
         self.delete_unnecessary_btn.clicked.connect(self.handle_delete_directory)
         self.check_unreferenced_btn.clicked.connect(self.handle_check_unreferenced_xmls)
@@ -524,12 +508,10 @@ class FileSanityWidget(QWidget):
         self.back_btn.clicked.connect(self.parent_window.return_to_main_menu)
 
     def showEvent(self, event: QEvent):
-        """Handle widget show event to update help icons."""
         super().showEvent(event)
         self.update_help_ui()
 
     def open_markdown_help(self, button_name):
-        """Open the corresponding .md file for the button."""
         md_name = button_name.lower().replace(" ", "_") + ".md"
         md_path = os.path.join(os.path.dirname(__file__), "docs", md_name)
         if not os.path.exists(md_path):
@@ -539,7 +521,6 @@ class FileSanityWidget(QWidget):
         self.markdown_viewers.append(viewer)
 
     def update_help_ui(self):
-        """Show/hide info icons based on parent window's help_enabled state."""
         help_enabled = self.parent_window.help_enabled if self.parent_window else False
         for label_name, label in self.button_info_labels.items():
             label.setVisible(help_enabled)
@@ -567,6 +548,8 @@ class FileSanityWidget(QWidget):
             self.feedback_label.setVisible(True)
             self.logger.debug("No directory selected")
             return
+        self.current_mode
+
         self.current_mode = "file_analytics"
         self.delete_all_btn.setVisible(False)
         self.refresh_table()
@@ -630,6 +613,7 @@ class FileSanityWidget(QWidget):
                 self.logger.debug(f"Populated table with {len(results)} rows, {total_files} total files")
             self.table.resizeColumnsToContents()
             self.table.setColumnWidth(2, max(110, self.table.columnWidth(2)))
+            self.table.viewport().update()  # Force UI redraw
         except Exception as e:
             self.feedback_label.setText(f"Error: {str(e)}")
             self.table.setVisible(False)
@@ -640,6 +624,8 @@ class FileSanityWidget(QWidget):
         self.logger.debug(f"Handling view for file type: {file_type}")
         dialog = FileListDialog(self.directory_path, file_type, self)
         dialog.exec()
+        if self.current_mode == "file_analytics":
+            self.refresh_table()  # Refresh parent table after dialog closes
 
     def handle_delete_folder(self, row: int, selected_dir: str):
         if self.is_deleting:
@@ -719,7 +705,6 @@ class FileSanityWidget(QWidget):
         moved_count = 0
         errors = []
         folders_to_delete = []
-        # Collect all folders from the table
         for row in range(self.table.rowCount()):
             folder_name_item = self.table.cellWidget(row, 0)
             folder_path_item = self.table.item(row, 1)
@@ -732,7 +717,6 @@ class FileSanityWidget(QWidget):
             full_path = os.path.normpath(os.path.join(selected_dir, folder_path))
             folders_to_delete.append((folder_name, full_path))
             self.logger.debug(f"Row {row}: Added to delete list: {folder_name}, Path: {full_path}")
-        # Process each folder
         self.logger.debug(f"Total folders to delete: {len(folders_to_delete)}")
         for folder_name, full_path in folders_to_delete:
             self.logger.debug(f"Attempting to move folder: {folder_name}, Path: {full_path}")
@@ -748,7 +732,6 @@ class FileSanityWidget(QWidget):
                 errors.append(f"{folder_name}: {str(e)}")
                 self.logger.error(f"Failed to move {full_path} to LegacyTextTuring: {str(e)}")
         self.table.setRowCount(0)
-        # Update feedback based on results
         if errors:
             self.feedback_label.setText(f"Moved {moved_count} folders to LegacyTextTuring, {len(errors)} failed: {'; '.join(errors)}")
             self.logger.debug(f"Moved {moved_count} folders, {len(errors)} failed: {'; '.join(errors)}")
@@ -758,7 +741,6 @@ class FileSanityWidget(QWidget):
         self.table.setVisible(False)
         self.feedback_label.setVisible(True)
         self.is_deleting = False
-        # Refresh table only after all deletions
         self.refresh_delete_directory(selected_dir)
         self.logger.debug(f"Final table row count after deletion: {self.table.rowCount()}")
 
@@ -870,6 +852,23 @@ class FileSanityWidget(QWidget):
             self.logger.debug("No DITA MAP file selected")
             return
         self.directory_path = str(Path(ditamap_path).parent)
+        
+        # Check for network drive and warn user
+        network_info = get_network_drive_info(self.directory_path)
+        if network_info['is_network']:
+            msg_box = QMessageBox(self)
+            msg_box.setWindowTitle("Network Drive Detected")
+            msg_box.setIcon(QMessageBox.Icon.Warning)
+            msg_box.setText(network_info['warning_message'])
+            msg_box.setInformativeText(network_info['recommendation'])
+            msg_box.setStandardButtons(QMessageBox.StandardButton.Ok | QMessageBox.StandardButton.Cancel)
+            msg_box.setDefaultButton(QMessageBox.StandardButton.Ok)
+            
+            result = msg_box.exec()
+            if result == QMessageBox.StandardButton.Cancel:
+                self.feedback_label.setText("Operation cancelled")
+                return
+        
         self.selected_ditamap = ditamap_path
         self.current_mode = "unreferenced_graphics"
         self.delete_all_btn.setVisible(True)
@@ -898,7 +897,7 @@ class FileSanityWidget(QWidget):
                     folder_url = QUrl.fromLocalFile(folder_full_path).toString()
                     folder_link_label = QLabel()
                     folder_link_label.setText(f'<a href="{folder_url}" style="color: #0000FF; text-decoration: underline;">{folder_path}</a>')
-                    folder_link_label.setStyleSheet("background-color: #E6ECEF;")
+                    file_link_label.setStyleSheet("background-color: #E6ECEF;")
                     folder_link_label.setOpenExternalLinks(True)
                     folder_link_label.setTextInteractionFlags(Qt.TextInteractionFlag.TextBrowserInteraction)
                     self.table.setCellWidget(row, 1, folder_link_label)

@@ -8,6 +8,7 @@ import json
 from pathlib import Path
 from markdown_viewer import MarkdownViewer
 import sys
+import time
 
 class TableCheckThread(QThread):
     result = pyqtSignal(list)
@@ -23,9 +24,9 @@ class TableCheckThread(QThread):
         overflow_pages = []
         try:
             python_path = sys.executable
-            print(f"TableCheckThread: Using Python executable: {python_path}")
+            print(f"TableCheckThread: Using Python executable: {python_path}", flush=True)
             result = subprocess.run([python_path, "-c", "import fitz; print('PyMuPDF installed')"], capture_output=True, text=True)
-            print(f"TableCheckThread: PyMuPDF check: {result.stdout.strip() or result.stderr.strip()}")
+            print(f"TableCheckThread: PyMuPDF check: {result.stdout.strip() or result.stderr.strip()}", flush=True)
 
             self.process = subprocess.Popen(
                 [python_path, "verify_pdf_tables.py", self.pdf_path],
@@ -39,19 +40,22 @@ class TableCheckThread(QThread):
             while self.process.poll() is None and not self.is_canceled:
                 line = self.process.stdout.readline().strip()
                 if line:
+                    print(f"TableCheckThread: Received line: {line}", flush=True)
                     if line.startswith("Progress:"):
                         self.progress.emit(line)
                     elif line.startswith("{"):
                         try:
                             data = json.loads(line)
+                            print(f"TableCheckThread: Parsed JSON: {data}", flush=True)
                             if "result" in data:
                                 overflow_pages = data["result"]
                             elif "error" in data:
                                 overflow_pages = [f"Error: {data['error']}"]
-                        except json.JSONDecodeError:
-                            pass
-            stderr = self.process.stderr.read()
+                        except json.JSONDecodeError as e:
+                            print(f"TableCheckThread: JSON decode error: {str(e)}", flush=True)
+            stderr = self.process.stderr.read().strip()
             if stderr and not self.is_canceled:
+                print(f"TableCheckThread: stderr: {stderr}", flush=True)
                 if not overflow_pages:
                     overflow_pages = [f"Error: {stderr}"]
             if not overflow_pages and not self.is_canceled:
@@ -60,9 +64,12 @@ class TableCheckThread(QThread):
             if self.process:
                 self.process.terminate()
             overflow_pages = ["Error: Validation timed out"]
+            print(f"TableCheckThread: Timeout error: {overflow_pages}", flush=True)
         except Exception as e:
             overflow_pages = [f"Error calling verify_pdf_tables.py: {str(e)}"]
+            print(f"TableCheckThread: Exception: {overflow_pages}", flush=True)
         if not self.is_canceled:
+            print(f"TableCheckThread: Emitting result: {overflow_pages}", flush=True)
             self.result.emit(overflow_pages)
 
     def cancel(self):
@@ -75,6 +82,7 @@ class TableCheckThread(QThread):
                 self.process.kill()
         self.terminate()
         self.wait()
+        print(f"TableCheckThread: Canceled", flush=True)
 
 class LinkCheckThread(QThread):
     result = pyqtSignal(dict)
@@ -85,49 +93,109 @@ class LinkCheckThread(QThread):
         self.pdf_path = pdf_path
         self.is_canceled = False
         self.process = None
+        self.script_dir = os.path.dirname(os.path.abspath(__file__))
 
     def run(self):
         link_report = {}
+        stdout_lines = []
         try:
             python_path = sys.executable
-            print(f"LinkCheckThread: Using Python executable: {python_path}")
-            result = subprocess.run([python_path, "-c", "import fitz; print('PyMuPDF installed')"], capture_output=True, text=True)
-            print(f"LinkCheckThread: PyMuPDF check: {result.stdout.strip() or result.stderr.strip()}")
+            print(f"LinkCheckThread: Using Python executable: {python_path}", flush=True)
+            print(f"LinkCheckThread: Working directory: {self.script_dir}", flush=True)
+            result = subprocess.run([python_path, "-c", "import fitz; print('PyMuPDF installed')"], capture_output=True, text=True, timeout=5)
+            print(f"LinkCheckThread: PyMuPDF check: {result.stdout.strip() or result.stderr.strip()}", flush=True)
 
             self.process = subprocess.Popen(
                 [python_path, "validate_external_pdf_links.py", self.pdf_path],
                 stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE,
                 text=True,
-                bufsize=1,
+                bufsize=8192,
                 universal_newlines=True,
-                env={"PYTHONUNBUFFERED": "1"}
+                env={"PYTHONUNBUFFERED": "1"},
+                cwd=self.script_dir
             )
-            while self.process.poll() is None and not self.is_canceled:
-                line = self.process.stdout.readline().strip()
-                if line:
-                    if line.startswith("Progress:"):
-                        self.progress.emit(line)
-                    elif line.startswith("{"):
-                        try:
-                            data = json.loads(line)
-                            link_report = data
-                        except json.JSONDecodeError:
-                            pass
-            stderr = self.process.stderr.read()
+            timeout = 1200  # 20-minute timeout
+            start_time = time.time()
+            while self.process.poll() is None and not self.is_canceled and (time.time() - start_time) < timeout:
+                try:
+                    line = self.process.stdout.readline().strip()
+                    if line:
+                        print(f"LinkCheckThread: Received line: {line}", flush=True)
+                        stdout_lines.append(line)
+                        if line.startswith("Progress:"):
+                            self.progress.emit(line)
+                except UnicodeDecodeError as e:
+                    print(f"LinkCheckThread: Unicode decode error: {str(e)}", flush=True)
+            stderr = self.process.stderr.read().strip()
             if stderr and not self.is_canceled:
-                if not link_report:
-                    link_report = {"error": f"Subprocess error: {stderr}"}
+                print(f"LinkCheckThread: stderr: {stderr}", flush=True)
+            return_code = self.process.poll()
+            print(f"LinkCheckThread: Subprocess return code: {return_code}", flush=True)
+            # Try parsing accumulated stdout lines
+            for line in stdout_lines:
+                if line.startswith("{"):
+                    try:
+                        data = json.loads(line)
+                        print(f"LinkCheckThread: Parsed JSON: {data}", flush=True)
+                        if "result" in data:
+                            link_report = data
+                        elif "error" in data:
+                            link_report = {"error": data["error"]}
+                        break
+                    except json.JSONDecodeError as e:
+                        print(f"LinkCheckThread: JSON decode error: {str(e)}", flush=True)
+            # Fallback to JSON files
             if not link_report and not self.is_canceled:
-                link_report = {"error": "No valid JSON response received"}
+                for _ in range(5):  # Retry 5 times
+                    partial_file = os.path.join(self.script_dir, 'validation_result_partial.json')
+                    result_file = os.path.join(self.script_dir, 'validation_result.json')
+                    if os.path.exists(partial_file):
+                        try:
+                            with open(partial_file, 'r', encoding='utf-8') as f:
+                                partial_data = json.load(f)
+                                print(f"LinkCheckThread: Loaded partial result: {partial_data}", flush=True)
+                                if "partial_result" in partial_data:
+                                    link_report = {"result": partial_data["partial_result"]}
+                                    break
+                        except (json.JSONDecodeError, OSError) as e:
+                            print(f"LinkCheckThread: Error reading {partial_file}: {str(e)}", flush=True)
+                    if os.path.exists(result_file):
+                        try:
+                            with open(result_file, 'r', encoding='utf-8') as f:
+                                link_report = json.load(f)
+                                print(f"LinkCheckThread: Loaded result from {result_file}: {link_report}", flush=True)
+                                break
+                        except (json.JSONDecodeError, OSError) as e:
+                            print(f"LinkCheckThread: Error reading {result_file}: {str(e)}", flush=True)
+                    time.sleep(2)  # Longer delay for file writes
+                if not link_report:
+                    link_report = {"error": f"No valid JSON response received and no fallback file found (checked {partial_file}, {result_file})"}
+            if not self.is_canceled:
+                print(f"LinkCheckThread: Emitting result: {link_report}", flush=True)
+                self.result.emit(link_report)
         except subprocess.TimeoutExpired:
             if self.process:
                 self.process.terminate()
+                try:
+                    self.process.wait(timeout=1)
+                except subprocess.TimeoutExpired:
+                    self.process.kill()
             link_report = {"error": "Validation timed out"}
+            print(f"LinkCheckThread: Timeout error: {link_report}", flush=True)
+            self.result.emit(link_report)
         except Exception as e:
             link_report = {"error": f"Error calling validate_external_pdf_links.py: {str(e)}"}
-        if not self.is_canceled:
+            print(f"LinkCheckThread: Exception: {link_report}", flush=True)
             self.result.emit(link_report)
+        finally:
+            if self.process and self.process.poll() is None:
+                self.process.terminate()
+                try:
+                    self.process.wait(timeout=1)
+                except subprocess.TimeoutExpired:
+                    self.process.kill()
+            print(f"LinkCheckThread: Subprocess cleaned up", flush=True)
 
     def cancel(self):
         self.is_canceled = True
@@ -139,9 +207,11 @@ class LinkCheckThread(QThread):
                 self.process.kill()
         self.terminate()
         self.wait()
-
+        print(f"LinkCheckThread: Canceled", flush=True)
+        
 class HTMLValidationThread(QThread):
     result = pyqtSignal(dict)
+    progress = pyqtSignal(str)
 
     def __init__(self, html_path, mode):
         super().__init__()
@@ -157,9 +227,9 @@ class HTMLValidationThread(QThread):
             if not os.path.exists(script_path):
                 raise FileNotFoundError(f"verify_html_content.py not found at {script_path}")
             python_path = sys.executable
-            print(f"HTMLValidationThread: Using Python executable: {python_path}")
+            print(f"HTMLValidationThread: Using Python executable: {python_path}", flush=True)
             result = subprocess.run([python_path, "-c", "import fitz; print('PyMuPDF installed')"], capture_output=True, text=True)
-            print(f"HTMLValidationThread: PyMuPDF check: {result.stdout.strip() or result.stderr.strip()}")
+            print(f"HTMLValidationThread: PyMuPDF check: {result.stdout.strip() or result.stderr.strip()}", flush=True)
 
             self.process = subprocess.Popen(
                 [python_path, script_path, self.html_path, self.mode],
@@ -170,34 +240,58 @@ class HTMLValidationThread(QThread):
                 universal_newlines=True,
                 env={"PYTHONUNBUFFERED": "1"}
             )
+            stdout_lines = []
             while self.process.poll() is None and not self.is_canceled:
                 line = self.process.stdout.readline().strip()
                 if line:
+                    print(f"HTMLValidationThread: Received line: {line}", flush=True)
                     if line.startswith("Progress:"):
                         self.progress.emit(line)
                     elif line.startswith("{"):
+                        stdout_lines.append(line)
                         try:
                             data = json.loads(line)
+                            print(f"HTMLValidationThread: Parsed JSON: {data}", flush=True)
                             if "result" in data:
                                 html_report = data["result"]
                             elif "error" in data:
                                 html_report = {"error": data["error"]}
-                        except json.JSONDecodeError:
-                            pass
-            stderr = self.process.stderr.read()
+                        except json.JSONDecodeError as e:
+                            print(f"HTMLValidationThread: JSON decode error: {str(e)}", flush=True)
+            stderr = self.process.stderr.read().strip()
             if stderr and not self.is_canceled:
+                print(f"HTMLValidationThread: stderr: {stderr}", flush=True)
                 if not html_report:
                     html_report = {"error": f"Subprocess error: {stderr}"}
+            return_code = self.process.poll()
+            print(f"HTMLValidationThread: Subprocess return code: {return_code}", flush=True)
             if not html_report and not self.is_canceled:
                 html_report = {"error": "No valid JSON response received"}
+            if not self.is_canceled:
+                print(f"HTMLValidationThread: Emitting result: {html_report}", flush=True)
+                self.result.emit(html_report)
         except subprocess.TimeoutExpired:
             if self.process:
                 self.process.terminate()
+                try:
+                    self.process.wait(timeout=1)
+                except subprocess.TimeoutExpired:
+                    self.process.kill()
             html_report = {"error": "Validation timed out"}
+            print(f"HTMLValidationThread: Timeout error: {html_report}", flush=True)
+            self.result.emit(html_report)
         except Exception as e:
             html_report = {"error": f"Thread exception: {str(e)}"}
-        if not self.is_canceled:
+            print(f"HTMLValidationThread: Exception: {html_report}", flush=True)
             self.result.emit(html_report)
+        finally:
+            if self.process and self.process.poll() is None:
+                self.process.terminate()
+                try:
+                    self.process.wait(timeout=1)
+                except subprocess.TimeoutExpired:
+                    self.process.kill()
+            print(f"HTMLValidationThread: Subprocess cleaned up", flush=True)
 
     def cancel(self):
         self.is_canceled = True
@@ -209,6 +303,7 @@ class HTMLValidationThread(QThread):
                 self.process.kill()
         self.terminate()
         self.wait()
+        print(f"HTMLValidationThread: Canceled", flush=True)
 
 class ValidateOutputWidget(QWidget):
     def __init__(self, parent=None):
@@ -230,10 +325,12 @@ class ValidateOutputWidget(QWidget):
         self.layout.setSpacing(5)
         self.setLayout(self.layout)
 
+        # Button panel will be added at the top (after button creation below)
+        
+        # Content area (feedback, tables, etc.)
         self.content_layout = QVBoxLayout()
         self.content_layout.setSpacing(5)
         self.content_layout.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        self.layout.addLayout(self.content_layout, stretch=1)
 
         self.feedback_label = QLabel("Select a check to continue")
         self.feedback_label.setFont(QFont("Helvetica", 12))
@@ -332,7 +429,9 @@ class ValidateOutputWidget(QWidget):
         html_layout.addWidget(self.validate_html_btn)
         button_panel.addLayout(html_layout)
 
+        # Add layouts in correct order: buttons at top, content in middle, back button at bottom
         self.layout.addLayout(button_panel, stretch=0)
+        self.layout.addLayout(self.content_layout, stretch=1)
 
         self.bottom_panel = QHBoxLayout()
         self.bottom_panel.setSpacing(8)
@@ -748,6 +847,7 @@ class ValidateOutputWidget(QWidget):
         self.link_check_thread.start()
 
     def display_table_report(self, overflow_pages):
+        print(f"display_table_report: Received report: {overflow_pages}", flush=True)
         self.clear_content()
         self.feedback_label.setFont(QFont("Helvetica", 14, QFont.Weight.Bold))
         if not overflow_pages or (isinstance(overflow_pages, list) and len(overflow_pages) == 0):
@@ -784,6 +884,7 @@ class ValidateOutputWidget(QWidget):
         self.back_btn.setEnabled(True)
 
     def display_link_report(self, link_report):
+        print(f"display_link_report: Received report: {link_report}", flush=True)
         self.clear_content()
         self.feedback_label.setFont(QFont("Helvetica", 12))
         if not isinstance(link_report, dict):
@@ -859,24 +960,200 @@ class ValidateOutputWidget(QWidget):
         self.validate_html_btn.setEnabled(True)
         self.back_btn.setEnabled(True)
 
+    def display_html_report(self, html_report):
+        print(f"display_html_report: Received report: {html_report}", flush=True)
+        self.clear_content()
+        self.feedback_label.setFont(QFont("Helvetica", 12))
+        
+        if not isinstance(html_report, dict):
+            self.feedback_label.setText("HTML Validation: Invalid response format")
+            self.feedback_label.setStyleSheet("color: #FFFFFF; background-color: transparent;")
+            self.feedback_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+            self.feedback_label.setVisible(True)
+            self.content_layout.addWidget(self.feedback_label, stretch=0)
+        elif "error" in html_report:
+            self.feedback_label.setText(f"HTML Validation: {html_report['error']}")
+            self.feedback_label.setStyleSheet("color: #FFFFFF; background-color: transparent;")
+            self.feedback_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+            self.feedback_label.setVisible(True)
+            self.content_layout.addWidget(self.feedback_label, stretch=0)
+        else:
+            total_links = html_report.get("total_internal_links", 0)
+            total_images = html_report.get("total_images", 0)
+            link_issues = html_report.get("link_issues", [])
+            image_issues = html_report.get("image_issues", [])
+            external_links = html_report.get("external_links", {})
+            total_external = external_links.get("total_external_links", 0)
+            
+            summary = [
+                f"HTML Validation Report:",
+                f"Total Internal Links: {total_links}",
+                f"Total Images: {total_images}",
+                f"Link Issues: {len(link_issues)}",
+                f"Image Issues: {len(image_issues)}",
+                f"Total External Links: {total_external}"
+            ]
+            self.feedback_label.setText("\n".join(summary))
+            self.feedback_label.setStyleSheet("color: #FFFFFF; background-color: transparent;")
+            self.feedback_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+            self.feedback_label.setVisible(True)
+            self.content_layout.addWidget(self.feedback_label, stretch=0)
+            
+            if not (link_issues or image_issues or external_links.get("redirected") or external_links.get("invalid") or external_links.get("unreachable")):
+                self.feedback_label.setText(self.feedback_label.text() + "\nNo issues detected.")
+            else:
+                if link_issues or image_issues:
+                    internal_label = QLabel("Internal Link and Image Issues:")
+                    internal_label.setFont(QFont("Helvetica", 12, QFont.Weight.Bold))
+                    internal_label.setStyleSheet("color: #FFFFFF; background-color: transparent;")
+                    self.content_layout.addWidget(internal_label, stretch=0)
+                    
+                    self.table.setRowCount(len(link_issues) + len(image_issues))
+                    self.table.setColumnCount(4)
+                    self.table.setHorizontalHeaderLabels(["File", "Link/Image", "Location", "Issue"])
+                    header = self.table.horizontalHeader()
+                    header.setSectionResizeMode(QHeaderView.ResizeMode.Stretch)
+                    self.table.setWordWrap(True)
+                    
+                    row = 0
+                    for issue in link_issues:
+                        file_item = QTableWidgetItem(issue["file"])
+                        file_item.setFlags(Qt.ItemFlag.ItemIsSelectable | Qt.ItemFlag.ItemIsEnabled)
+                        file_item.setToolTip(f"Click to open: {issue['file']}")
+                        file_item.setData(Qt.ItemDataRole.UserRole, os.path.join(os.path.dirname(self.html_path), issue["location"]))
+                        file_font = QFont("Helvetica", 12)
+                        file_font.setUnderline(True)
+                        file_item.setFont(file_font)
+                        file_item.setForeground(QColor("#0D6E6E"))
+                        self.table.setItem(row, 0, file_item)
+                        
+                        href_item = QTableWidgetItem(issue["href"])
+                        href_item.setFlags(Qt.ItemFlag.ItemIsSelectable | Qt.ItemFlag.ItemIsEnabled)
+                        self.table.setItem(row, 1, href_item)
+                        
+                        location_item = QTableWidgetItem(issue["location"])
+                        location_item.setFlags(Qt.ItemFlag.ItemIsSelectable | Qt.ItemFlag.ItemIsEnabled)
+                        location_item.setToolTip(f"Location: {issue['location']}")
+                        self.table.setItem(row, 2, location_item)
+                        
+                        issue_item = QTableWidgetItem(issue["issue"])
+                        issue_item.setFlags(Qt.ItemFlag.ItemIsSelectable | Qt.ItemFlag.ItemIsEnabled)
+                        self.table.setItem(row, 3, issue_item)
+                        row += 1
+                        
+                    for issue in image_issues:
+                        file_item = QTableWidgetItem(issue["file"])
+                        file_item.setFlags(Qt.ItemFlag.ItemIsSelectable | Qt.ItemFlag.ItemIsEnabled)
+                        file_item.setToolTip(f"Click to open: {issue['file']}")
+                        file_item.setData(Qt.ItemDataRole.UserRole, os.path.join(os.path.dirname(self.html_path), issue["location"]))
+                        file_font = QFont("Helvetica", 12)
+                        file_font.setUnderline(True)
+                        file_item.setFont(file_font)
+                        file_item.setForeground(QColor("#0D6E6E"))
+                        self.table.setItem(row, 0, file_item)
+                        
+                        src_item = QTableWidgetItem(issue["src"])
+                        src_item.setFlags(Qt.ItemFlag.ItemIsSelectable | Qt.ItemFlag.ItemIsEnabled)
+                        self.table.setItem(row, 1, src_item)
+                        
+                        location_item = QTableWidgetItem(issue["location"])
+                        location_item.setFlags(Qt.ItemFlag.ItemIsSelectable | Qt.ItemFlag.ItemIsEnabled)
+                        location_item.setToolTip(f"Location: {issue['location']}")
+                        self.table.setItem(row, 2, location_item)
+                        
+                        issue_item = QTableWidgetItem(issue["issue"])
+                        issue_item.setFlags(Qt.ItemFlag.ItemIsSelectable | Qt.ItemFlag.ItemIsEnabled)
+                        self.table.setItem(row, 3, issue_item)
+                        row += 1
+                        
+                    self.table.resizeRowsToContents()
+                    self.table.cellClicked.connect(self.open_internal_url)
+                    self.table.setVisible(True)
+                    self.content_layout.addWidget(self.table, stretch=0)
+                
+                if external_links.get("redirected") or external_links.get("invalid") or external_links.get("unreachable"):
+                    external_label = QLabel("External Link Issues:")
+                    external_label.setFont(QFont("Helvetica", 12, QFont.Weight.Bold))
+                    external_label.setStyleSheet("color: #FFFFFF; background-color: transparent;")
+                    self.content_layout.addWidget(external_label, stretch=0)
+                    
+                    external_issues = (
+                        external_links.get("redirected", []) +
+                        external_links.get("invalid", []) +
+                        external_links.get("unreachable", [])
+                    )
+                    self.external_table.setRowCount(len(external_issues))
+                    self.external_table.setColumnCount(4)
+                    self.external_table.setHorizontalHeaderLabels(["Files", "Link", "Redirector Link", "Status"])
+                    external_header = self.external_table.horizontalHeader()
+                    external_header.setSectionResizeMode(QHeaderView.ResizeMode.Stretch)
+                    self.external_table.setWordWrap(True)
+                    self.external_table.setColumnWidth(3, 200)
+                    
+                    for row, issue in enumerate(external_issues):
+                        files_str = ", ".join(issue["files"])
+                        file_item = QTableWidgetItem(files_str)
+                        file_item.setFlags(Qt.ItemFlag.ItemIsSelectable | Qt.ItemFlag.ItemIsEnabled)
+                        file_item.setToolTip(f"Click to open first file: {issue['files'][0]}")
+                        file_item.setData(Qt.ItemDataRole.UserRole, os.path.join(os.path.dirname(self.html_path), issue["files"][0]))
+                        file_font = QFont("Helvetica", 12)
+                        file_font.setUnderline(True)
+                        file_item.setFont(file_font)
+                        file_item.setForeground(QColor("#0D6E6E"))
+                        self.external_table.setItem(row, 0, file_item)
+                        
+                        link_item = QTableWidgetItem(issue["url"])
+                        link_font = QFont("Helvetica", 12)
+                        link_font.setUnderline(True)
+                        link_item.setFont(link_font)
+                        link_item.setForeground(QColor("#0D6E6E"))
+                        link_item.setData(Qt.ItemDataRole.UserRole, issue["url"])
+                        link_item.setFlags(Qt.ItemFlag.ItemIsSelectable | Qt.ItemFlag.ItemIsEnabled)
+                        link_item.setToolTip(f"Click to open: {issue['url']}")
+                        self.external_table.setItem(row, 1, link_item)
+                        
+                        redirector_item = QTableWidgetItem(issue.get("redirected_to", "N/A"))
+                        if issue.get("redirected_to"):
+                            redirector_font = QFont("Helvetica", 12)
+                            redirector_font.setUnderline(True)
+                            redirector_item.setFont(redirector_font)
+                            redirector_item.setForeground(QColor("#0D6E6E"))
+                            redirector_item.setData(Qt.ItemDataRole.UserRole, issue["redirected_to"])
+                            redirector_item.setFlags(Qt.ItemFlag.ItemIsSelectable | Qt.ItemFlag.ItemIsEnabled)
+                            redirector_item.setToolTip(f"Click to open: {issue['redirected_to']}")
+                        self.external_table.setItem(row, 2, redirector_item)
+                        
+                        status_item = QTableWidgetItem(issue["reason"])
+                        status_item.setFlags(Qt.ItemFlag.ItemIsSelectable | Qt.ItemFlag.ItemIsEnabled)
+                        self.external_table.setItem(row, 3, status_item)
+                        
+                    self.external_table.resizeRowsToContents()
+                    self.external_table.cellClicked.connect(self.open_external_url)
+                    self.external_table.setVisible(True)
+                    self.content_layout.addWidget(self.external_table, stretch=0)
+            
+        self.validate_pdf_btn.setEnabled(True)
+        self.validate_html_btn.setEnabled(True)
+        self.back_btn.setEnabled(True)
+
     def open_internal_url(self, row, col):
-        if col != 1:  # Only "File" column (col=1) is clickable
+        if col not in [0, 1]:  # Only "File" (col=0) and "Link/Image" (col=1) are clickable
             return
         item = self.table.item(row, col)
         if item:
             user_role_data = item.data(Qt.ItemDataRole.UserRole)
             if user_role_data:
-                url = QUrl(user_role_data)
+                url = QUrl.fromLocalFile(user_role_data) if col == 0 else QUrl(user_role_data)
                 if url.isValid():
                     QDesktopServices.openUrl(url)
 
     def open_external_url(self, row, col):
-        if col not in [0, 1, 2]:  # Only "File" (col=0), "Link" (col=1), and "Redirector Link" (col=2) are clickable
+        if col not in [0, 1, 2]:  # Only "Files" (col=0), "Link" (col=1), and "Redirector Link" (col=2) are clickable
             return
         item = self.external_table.item(row, col)
         if item:
             user_role_data = item.data(Qt.ItemDataRole.UserRole)
             if user_role_data:
-                url = QUrl(user_role_data)
+                url = QUrl.fromLocalFile(user_role_data) if col == 0 else QUrl(user_role_data)
                 if url.isValid():
                     QDesktopServices.openUrl(url)

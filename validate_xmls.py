@@ -5,7 +5,7 @@ import tempfile
 from pathlib import Path
 from urllib.parse import unquote, quote
 from lxml import etree
-from PyQt6.QtWidgets import QWidget, QVBoxLayout, QHBoxLayout, QPushButton, QLabel, QFileDialog, QTableWidget, QTableWidgetItem, QMenu, QApplication, QScrollArea, QFrame, QGridLayout, QSizePolicy
+from PyQt6.QtWidgets import QWidget, QVBoxLayout, QHBoxLayout, QPushButton, QLabel, QFileDialog, QTableWidget, QTableWidgetItem, QMenu, QApplication, QScrollArea, QFrame, QGridLayout, QSizePolicy, QMessageBox
 from PyQt6.QtCore import Qt, QTimer, QUrl
 from PyQt6.QtGui import QFont, QBrush, QColor, QDesktopServices, QPixmap
 from markdown_viewer import MarkdownViewer
@@ -14,6 +14,7 @@ from fix_tables import validate_tables
 from fix_graphics import validate_graphics
 from validate_chapter_toc import validate_chapter_toc, validate_subchapter_toc
 from empty import update_xml_file, is_empty_except_title
+from network_utils import get_network_drive_info
 
 # Set up logging with file output only (no console)
 log_file = os.path.expanduser("~/Desktop/ftp_debug.log")
@@ -391,7 +392,25 @@ class ValidateXMLsWidget(QWidget):
         self.validate_chapter_toc_btn.clicked.connect(self.handle_validate_chapter_toc)
         self.fix_empty_headings_btn.clicked.connect(self.handle_fix_empty_headings)
         self.refresh_btn.clicked.connect(self.handle_refresh)
-        self.back_btn.clicked.connect(self.parent_window.return_to_main_menu)
+        self.back_btn.clicked.connect(self.handle_back_to_menu)
+
+    def handle_back_to_menu(self):
+        """Reset widget state and return to main menu."""
+        logger.debug("Handling back to menu, resetting widget state")
+        self.directory_path = ""
+        self.ditamap_path = ""
+        self.current_mode = ""
+        self.file_paths = []
+        self.href_map = {}
+        self.table.setRowCount(0)
+        self.table.setVisible(False)
+        self.scroll_area.setVisible(False)
+        self.fix_all_btn.setVisible(False)
+        self.feedback_label.setText("Select a check to begin")
+        self.feedback_label.setVisible(True)
+        self._flush_handlers()
+        if self.parent_window:
+            self.parent_window.return_to_main_menu()
 
     def open_markdown_help(self, button_name):
         """Open the corresponding .md file for the button."""
@@ -439,7 +458,15 @@ class ValidateXMLsWidget(QWidget):
         self.directory_path = QFileDialog.getExistingDirectory(self, "Select Directory", "")
         if not self.directory_path:
             self.feedback_label.setText("No directory selected")
+            self.table.setVisible(False)
+            self.scroll_area.setVisible(False)
+            self.feedback_label.setVisible(True)
             return
+        self.current_mode = "remove_duplicate_ids"  # Set mode to avoid conflicts
+        self.table.setRowCount(0)  # Clear table
+        self.table.setVisible(False)  # Hide table
+        self.scroll_area.setVisible(False)  # Hide scroll area
+        self.feedback_label.setVisible(True)  # Show feedback label
         self.feedback_label.setText("Processing...")
         try:
             duplicates_fixed, files_modified, log_success = remove_duplicate_ids(self, self.directory_path)
@@ -456,6 +483,23 @@ class ValidateXMLsWidget(QWidget):
         if not self.directory_path:
             self.feedback_label.setText("No directory selected")
             return
+        
+        # Check for network drive and warn user
+        network_info = get_network_drive_info(self.directory_path)
+        if network_info['is_network']:
+            msg_box = QMessageBox(self)
+            msg_box.setWindowTitle("Network Drive Detected")
+            msg_box.setIcon(QMessageBox.Icon.Warning)
+            msg_box.setText(network_info['warning_message'])
+            msg_box.setInformativeText(network_info['recommendation'])
+            msg_box.setStandardButtons(QMessageBox.StandardButton.Ok | QMessageBox.StandardButton.Cancel)
+            msg_box.setDefaultButton(QMessageBox.StandardButton.Ok)
+            
+            result = msg_box.exec()
+            if result == QMessageBox.StandardButton.Cancel:
+                self.feedback_label.setText("Operation cancelled")
+                return
+        
         self.current_mode = "tables"
         self.table.setVisible(True)
         self.scroll_area.setVisible(False)
@@ -469,6 +513,23 @@ class ValidateXMLsWidget(QWidget):
         if not self.directory_path:
             self.feedback_label.setText("No directory selected")
             return
+        
+        # Check for network drive and warn user
+        network_info = get_network_drive_info(self.directory_path)
+        if network_info['is_network']:
+            msg_box = QMessageBox(self)
+            msg_box.setWindowTitle("Network Drive Detected")
+            msg_box.setIcon(QMessageBox.Icon.Warning)
+            msg_box.setText(network_info['warning_message'])
+            msg_box.setInformativeText(network_info['recommendation'])
+            msg_box.setStandardButtons(QMessageBox.StandardButton.Ok | QMessageBox.StandardButton.Cancel)
+            msg_box.setDefaultButton(QMessageBox.StandardButton.Ok)
+            
+            result = msg_box.exec()
+            if result == QMessageBox.StandardButton.Cancel:
+                self.feedback_label.setText("Operation cancelled")
+                return
+        
         self.current_mode = "graphics"
         self.table.setVisible(True)
         self.scroll_area.setVisible(False)

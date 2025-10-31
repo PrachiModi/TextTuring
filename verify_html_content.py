@@ -1,18 +1,19 @@
 import sys
 import json
 import os
-import signal
+import platform
+import threading
 import logging
 from pathlib import Path
 from lxml import etree
 from lxml import html
 from urllib.parse import unquote
 import glob
-import asyncio
-import httpx
+import requests
+from concurrent.futures import ThreadPoolExecutor
 import time
 
-# Set up logging to a file
+# Set up logging
 logging.basicConfig(
     level=logging.DEBUG,
     format='%(asctime)s - %(levelname)s - [%(funcName)s:%(lineno)d] - %(message)s',
@@ -20,88 +21,79 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-CONCURRENT_LIMIT = 50
-TIMEOUT = 10
+CONCURRENT_LIMIT = 50  # Reduced for balanced performance
+TIMEOUT = 5  # Reduced for faster failure on unreachable URLs
 URL_CACHE = {}
 
-def timeout_handler(signum, frame):
+def timeout_handler():
     raise TimeoutError("File processing timed out")
 
-async def check_link_validity(url, files, client, sem):
-    """Check if an external hyperlink is valid, with retries and GET fallback."""
+def check_link_validity(url, files, session):
+    """Check if an external hyperlink is valid, with GET fallback."""
     logger.debug(f"Checking URL: {url}")
     if url in URL_CACHE:
         logger.debug(f"Using cached result for {url}")
         return URL_CACHE[url]
 
-    async with sem:
-        headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"}
-        attempts = 0
-        max_attempts = 3
-        while attempts < max_attempts:
-            attempts += 1
-            try:
-                start_time = time.time()
-                response = await client.head(url, follow_redirects=False, timeout=TIMEOUT, headers=headers)
-                duration = time.time() - start_time
-                logger.debug(f"URL={url}, Attempt={attempts}, Method=HEAD, Status={response.status_code}, Duration={duration:.3f}s")
-                
-                if response.status_code in (301, 302):
-                    redirected_url = response.headers.get("Location", "")
-                    result = ({"url": url, "files": files, "reason": f"Redirected, Status: {response.status_code}", "redirected_to": redirected_url}, "redirected")
-                    URL_CACHE[url] = result
-                    return result
-                elif response.status_code >= 400:
-                    result = ({"url": url, "files": files, "reason": f"Status: {response.status_code}"}, "invalid")
-                    URL_CACHE[url] = result
-                    return result
-                else:
-                    result = ({"url": url, "files": files, "reason": f"Valid, Status: {response.status_code}"}, "valid")
-                    URL_CACHE[url] = result
-                    return result
+    headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"}
+    try:
+        start_time = time.time()
+        response = session.head(url, allow_redirects=False, timeout=TIMEOUT, headers=headers)
+        duration = time.time() - start_time
+        logger.debug(f"URL={url}, Method=HEAD, Status={response.status_code}, Duration={duration:.3f}s")
+        
+        if response.status_code in (301, 302):
+            redirected_url = response.headers.get("Location", "")
+            result = ({"url": url, "files": files, "reason": f"Redirected, Status: {response.status_code}", "redirected_to": redirected_url}, "redirected")
+            URL_CACHE[url] = result
+            return result
+        elif response.status_code >= 400:
+            result = ({"url": url, "files": files, "reason": f"Status: {response.status_code}"}, "invalid")
+            URL_CACHE[url] = result
+            return result
+        else:
+            result = ({"url": url, "files": files, "reason": f"Valid, Status: {response.status_code}"}, "valid")
+            URL_CACHE[url] = result
+            return result
+    
+    except requests.Timeout:
+        logger.debug(f"URL={url}, Method=HEAD, Timeout after {TIMEOUT}s")
+        try:
+            start_time = time.time()
+            response = session.get(url, allow_redirects=False, timeout=TIMEOUT, headers=headers)
+            duration = time.time() - start_time
+            logger.debug(f"URL={url}, Method=GET, Status={response.status_code}, Duration={duration:.3f}s")
             
-            except httpx.TimeoutException:
-                if attempts == max_attempts:
-                    logger.debug(f"URL={url}, Attempt={attempts}, Method=HEAD, Timeout after {TIMEOUT}s")
-                    try:
-                        start_time = time.time()
-                        response = await client.get(url, follow_redirects=False, timeout=TIMEOUT, headers=headers)
-                        duration = time.time() - start_time
-                        logger.debug(f"URL={url}, Attempt={attempts}, Method=GET, Status={response.status_code}, Duration={duration:.3f}s")
-                        
-                        if response.status_code in (301, 302):
-                            redirected_url = response.headers.get("Location", "")
-                            result = ({"url": url, "files": files, "reason": f"Redirected, Status: {response.status_code}", "redirected_to": redirected_url}, "redirected")
-                            URL_CACHE[url] = result
-                            return result
-                        elif response.status_code >= 400:
-                            result = ({"url": url, "files": files, "reason": f"Status: {response.status_code}"}, "invalid")
-                            URL_CACHE[url] = result
-                            return result
-                        else:
-                            result = ({"url": url, "files": files, "reason": f"Valid, Status: {response.status_code}"}, "valid")
-                            URL_CACHE[url] = result
-                            return result
-                    except httpx.TimeoutException:
-                        logger.debug(f"URL={url}, Attempt={attempts}, Method=GET, Timeout after {TIMEOUT}s")
-                        result = ({"url": url, "files": files, "reason": f"Timeout after {TIMEOUT}s"}, "unreachable")
-                        URL_CACHE[url] = result
-                        return result
-                    except Exception as e:
-                        logger.debug(f"URL={url}, Attempt={attempts}, Method=GET, Error={str(e)}")
-                        result = ({"url": url, "files": files, "reason": f"Error: {str(e)}"}, "unreachable")
-                        URL_CACHE[url] = result
-                        return result
-            except Exception as e:
-                if attempts == max_attempts:
-                    logger.debug(f"URL={url}, Attempt={attempts}, Method=HEAD, Error={str(e)}")
-                    result = ({"url": url, "files": files, "reason": f"Error: {str(e)}"}, "unreachable")
-                    URL_CACHE[url] = result
-                    return result
-                logger.debug(f"URL={url}, Attempt={attempts}, Method=HEAD, Retrying due to {str(e)}")
-                await asyncio.sleep(1)
+            if response.status_code in (301, 302):
+                redirected_url = response.headers.get("Location", "")
+                result = ({"url": url, "files": files, "reason": f"Redirected, Status: {response.status_code}", "redirected_to": redirected_url}, "redirected")
+                URL_CACHE[url] = result
+                return result
+            elif response.status_code >= 400:
+                result = ({"url": url, "files": files, "reason": f"Status: {response.status_code}"}, "invalid")
+                URL_CACHE[url] = result
+                return result
+            else:
+                result = ({"url": url, "files": files, "reason": f"Valid, Status: {response.status_code}"}, "valid")
+                URL_CACHE[url] = result
+                return result
+        except requests.Timeout:
+            logger.debug(f"URL={url}, Method=GET, Timeout after {TIMEOUT}s")
+            result = ({"url": url, "files": files, "reason": f"Timeout after {TIMEOUT}s"}, "unreachable")
+            URL_CACHE[url] = result
+            return result
+        except Exception as e:
+            logger.debug(f"URL={url}, Method=GET, Error={str(e)}")
+            result = ({"url": url, "files": files, "reason": f"Error: {str(e)}"}, "unreachable")
+            URL_CACHE[url] = result
+            return result
+    except Exception as e:
+        logger.debug(f"URL={url}, Method=HEAD, Error={str(e)}")
+        result = ({"url": url, "files": files, "reason": f"Error: {str(e)}"}, "unreachable")
+        URL_CACHE[url] = result
+        return result
 
-async def validate_all_external_links(external_links):
+def validate_all_external_links(external_links):
     """Validate all unique external links concurrently in batches."""
     logger.info(f"Starting validation of {len(external_links)} unique URLs")
     invalid_links = []
@@ -111,16 +103,12 @@ async def validate_all_external_links(external_links):
     unique_urls = list(external_links.keys())
     batch_size = 100
 
-    sem = asyncio.Semaphore(CONCURRENT_LIMIT)
-    async with httpx.AsyncClient() as client:
-        for i in range(0, len(unique_urls), batch_size):
-            batch_urls = unique_urls[i:i + batch_size]
-            tasks = []
-            for url in batch_urls:
-                tasks.append(check_link_validity(url, list(set(external_links[url])), client, sem))  # Deduplicate files
-            logger.debug(f"Processing batch {i//batch_size + 1} with {len(batch_urls)} URLs")
-            try:
-                results = await asyncio.gather(*tasks, return_exceptions=True)
+    with requests.Session() as session:
+        with ThreadPoolExecutor(max_workers=CONCURRENT_LIMIT) as executor:
+            for i in range(0, len(unique_urls), batch_size):
+                batch_urls = unique_urls[i:i + batch_size]
+                results = list(executor.map(lambda url: check_link_validity(url, list(set(external_links[url])), session), batch_urls))
+                logger.debug(f"Processing batch {i//batch_size + 1} with {len(batch_urls)} URLs")
                 for result in results:
                     if isinstance(result, Exception):
                         logger.error(f"Validation error: {str(result)}")
@@ -135,8 +123,7 @@ async def validate_all_external_links(external_links):
                         unreachable_links.append(link_info)
                     elif category == "valid":
                         valid_links.append(link_info)
-            except Exception as e:
-                logger.error(f"Batch validation error: {str(e)}")
+                print(f"Progress: Validated {i + len(batch_urls)}/{len(unique_urls)} URLs", flush=True)
 
     logger.info(f"Validation complete: Valid={len(valid_links)}, Redirected={len(redirected_links)}, Invalid={len(invalid_links)}, Unreachable={len(unreachable_links)}")
     return {
@@ -190,9 +177,8 @@ def validate_links_and_images(html_path):
         logger.debug(f"Processing HTML file: {html_file.name}")
 
         try:
-            signal.signal(signal.SIGALRM, timeout_handler)
-            signal.alarm(120)
-
+            timer = threading.Timer(120, timeout_handler)
+            timer.start()
             parser = etree.HTMLParser(recover=True)
             with open(html_file, 'rb') as f:
                 tree = html.parse(f, parser=parser)
@@ -202,7 +188,7 @@ def validate_links_and_images(html_path):
             total_links += len(links)
             logger.debug(f"Found {len(links)} links in {html_file.name}")
 
-            file_added = set()  # Track files added for each URL in this file
+            file_added = set()
             for link in links:
                 href = link.get("href")
                 if not href:
@@ -210,7 +196,7 @@ def validate_links_and_images(html_path):
                 if href.startswith(("http://", "https://")):
                     href = unquote(href)
                     file_path_str = str(html_file.relative_to(base_dir))
-                    if (href, file_path_str) not in file_added:  # Only add file once per URL
+                    if (href, file_path_str) not in file_added:
                         external_links.setdefault(href, []).append(file_path_str)
                         file_added.add((href, file_path_str))
                     continue
@@ -306,7 +292,7 @@ def validate_links_and_images(html_path):
                         "issue": f"Invalid path in src: {str(e)}"
                     })
 
-            signal.alarm(0)
+            timer.cancel()
 
         except TimeoutError:
             logger.error(f"Timeout processing {html_file.name}")
@@ -322,7 +308,7 @@ def validate_links_and_images(html_path):
                 "location": str(html_file.relative_to(base_dir)),
                 "issue": "File processing timed out"
             })
-            signal.alarm(0)
+            timer.cancel()
 
         except html.HtmlParsingError as e:
             logger.error(f"Error parsing {html_file.name}: {str(e)}")
@@ -358,7 +344,7 @@ def validate_links_and_images(html_path):
     external_result = {}
     if external_links:
         try:
-            external_result = asyncio.run(validate_all_external_links(external_links))
+            external_result = validate_all_external_links(external_links)
             total_external_links = external_result.get("total_external_links", 0)
         except Exception as e:
             logger.error(f"External link validation failed: {str(e)}")
@@ -374,7 +360,7 @@ def validate_links_and_images(html_path):
     }
 
 def validate_internal_links(html_path, validate_html=True):
-    """Validate internal links in HTML or XML/DITA files (unchanged)."""
+    """Validate internal links in HTML or XML/DITA files."""
     logger.info(f"Starting internal links validation for {html_path}, validate_html={validate_html}")
     total_links = 0
     link_issues = []
@@ -406,13 +392,11 @@ def validate_internal_links(html_path, validate_html=True):
 
         for html_file in html_files:
             file_path = str(html_file)
-            folder_name = html_file.parent.name
             logger.info(f"Processing HTML file: {html_file.name}")
 
             try:
-                signal.signal(signal.SIGALRM, timeout_handler)
-                signal.alarm(50)
-
+                timer = threading.Timer(50, timeout_handler)
+                timer.start()
                 parser = etree.HTMLParser(recover=True)
                 with open(html_file, 'rb') as f:
                     tree = html.parse(f, parser=parser)
@@ -472,7 +456,7 @@ def validate_internal_links(html_path, validate_html=True):
                             "issue": f"Invalid path in href: {str(e)}"
                         })
 
-                signal.alarm(0)
+                timer.cancel()
 
             except TimeoutError:
                 logger.error(f"Timeout processing {html_file.name}")
@@ -482,7 +466,7 @@ def validate_internal_links(html_path, validate_html=True):
                     "location": str(html_file.relative_to(base_dir)),
                     "issue": "File processing timed out"
                 })
-                signal.alarm(0)
+                timer.cancel()
             except html.HtmlParsingError as e:
                 logger.error(f"Error parsing {html_file.name}: {str(e)}")
                 link_issues.append({
@@ -524,13 +508,11 @@ def validate_internal_links(html_path, validate_html=True):
 
         for xml_path in xml_files:
             file_path = str(xml_path)
-            folder_name = xml_path.parent.name
             logger.info(f"Processing file: {xml_path.name}")
 
             try:
-                signal.signal(signal.SIGALRM, timeout_handler)
-                signal.alarm(50)
-
+                timer = threading.Timer(50, timeout_handler)
+                timer.start()
                 parser = etree.XMLParser(recover=True)
                 tree = etree.parse(str(xml_path), parser)
                 links = tree.xpath(
@@ -592,7 +574,7 @@ def validate_internal_links(html_path, validate_html=True):
                             "issue": f"Invalid path in href: {str(e)}"
                         })
 
-                signal.alarm(0)
+                timer.cancel()
 
             except TimeoutError:
                 logger.error(f"Timeout processing {xml_path.name}")
@@ -602,7 +584,7 @@ def validate_internal_links(html_path, validate_html=True):
                     "location": str(xml_path.relative_to(base_dir)),
                     "issue": "File processing timed out"
                 })
-                signal.alarm(0)
+                timer.cancel()
             except etree.LxmlError as e:
                 logger.error(f"Error parsing {xml_path.name}: {str(e)}")
                 link_issues.append({
@@ -627,7 +609,7 @@ def validate_internal_links(html_path, validate_html=True):
     }
 
 def validate_images(html_path):
-    """Validate images in HTML files (unchanged)."""
+    """Validate images in HTML files."""
     logger.info(f"Starting image validation for {html_path}")
     total_images = 0
     image_issues = []
@@ -654,13 +636,11 @@ def validate_images(html_path):
 
     for html_file in html_files:
         file_path = str(html_file)
-        folder_name = html_file.parent.name
         logger.info(f"Processing HTML file: {html_file.name}")
 
         try:
-            signal.signal(signal.SIGALRM, timeout_handler)
-            signal.alarm(50)
-
+            timer = threading.Timer(50, timeout_handler)
+            timer.start()
             parser = etree.HTMLParser(recover=True)
             with open(html_file, 'rb') as f:
                 tree = html.parse(f, parser=parser)
@@ -707,7 +687,7 @@ def validate_images(html_path):
                         "issue": f"Invalid path in src: {str(e)}"
                     })
 
-            signal.alarm(0)
+            timer.cancel()
 
         except TimeoutError:
             logger.error(f"Timeout processing {html_file.name}")
@@ -717,7 +697,7 @@ def validate_images(html_path):
                 "location": str(html_file.relative_to(base_dir)),
                 "issue": "File processing timed out"
             })
-            signal.alarm(0)
+            timer.cancel()
         except html.HtmlParsingError as e:
             logger.error(f"Error parsing {html_file.name}: {str(e)}")
             image_issues.append({

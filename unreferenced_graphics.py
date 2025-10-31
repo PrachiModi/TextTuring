@@ -2,8 +2,33 @@ import os
 from lxml import etree
 from urllib.parse import unquote
 import shutil
+from concurrent.futures import ProcessPoolExecutor, as_completed
+from multiprocessing import cpu_count
 
-def find_unreferenced_graphics(ditamap_path, directory_path):
+def _parse_xml_for_images(xml_path):
+    """
+    Parse a single XML file for image references.
+    
+    Args:
+        xml_path: Path to the XML file.
+        
+    Returns:
+        set: Set of image paths referenced in this XML file.
+    """
+    referenced_images = set()
+    try:
+        xml_tree = etree.parse(xml_path)
+        image_hrefs = xml_tree.xpath("//image/@href")
+        for image_href in image_hrefs:
+            image_path = os.path.normpath(os.path.join(os.path.dirname(xml_path), unquote(image_href)))
+            if image_path.lower().endswith((".png", ".jpg", ".jpeg")):
+                referenced_images.add(image_path)
+    except Exception as e:
+        print(f"Warning: Error parsing XML file {xml_path}: {str(e)}")
+    
+    return referenced_images
+
+def find_unreferenced_graphics(ditamap_path, directory_path, use_multiprocessing: bool = True):
     """
     Find PNG, JPG, and JPEG images in the Graphics folder that are not referenced in the DITA map or its XML files,
     excluding LegacyTextTuring.
@@ -11,6 +36,7 @@ def find_unreferenced_graphics(ditamap_path, directory_path):
     Args:
         ditamap_path (str): Path to the DITA map file.
         directory_path (str): Root directory containing the DITA map and Graphics folder.
+        use_multiprocessing (bool): Whether to use parallel processing (default: True).
     
     Returns:
         list: List of tuples (file_name, folder_path, status) for unreferenced images.
@@ -37,18 +63,29 @@ def find_unreferenced_graphics(ditamap_path, directory_path):
 
     # Parse referenced XML files for <image> elements
     ditamap_dir = os.path.dirname(ditamap_path)
+    xml_files_to_parse = []
     for href in xml_hrefs:
         xml_path = os.path.normpath(os.path.join(ditamap_dir, href))
         if os.path.exists(xml_path) and xml_path in xml_files:
-            try:
-                xml_tree = etree.parse(xml_path)
-                image_hrefs = xml_tree.xpath("//image/@href")
-                for image_href in image_hrefs:
-                    image_path = os.path.normpath(os.path.join(os.path.dirname(xml_path), unquote(image_href)))
-                    if image_path.lower().endswith((".png", ".jpg", ".jpeg")):
-                        referenced_images.add(image_path)
-            except Exception as e:
-                print(f"Warning: Error parsing XML file {xml_path}: {str(e)}")
+            xml_files_to_parse.append(xml_path)
+    
+    if xml_files_to_parse:
+        if use_multiprocessing and len(xml_files_to_parse) > 1:
+            # Use multiprocessing for better performance
+            max_workers = min(cpu_count(), len(xml_files_to_parse))
+            with ProcessPoolExecutor(max_workers=max_workers) as executor:
+                futures = {executor.submit(_parse_xml_for_images, xml_path): xml_path for xml_path in xml_files_to_parse}
+                for future in as_completed(futures):
+                    try:
+                        images = future.result()
+                        referenced_images.update(images)
+                    except Exception:
+                        pass  # Skip files that cause errors
+        else:
+            # Single-threaded processing
+            for xml_path in xml_files_to_parse:
+                images = _parse_xml_for_images(xml_path)
+                referenced_images.update(images)
 
     # Collect PNG, JPG, and JPEG files from Graphics folder, excluding LegacyTextTuring
     graphics_dir = os.path.join(directory_path, "Graphics")

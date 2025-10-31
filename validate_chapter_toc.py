@@ -32,7 +32,7 @@ intro_phrases = [
 
 def validate_chapter_toc(ditamap_path: str) -> list:
     logger = setup_logging(ditamap_path)
-    results = []
+    results = set()  # Use set for unique results
     logger.debug(f"=== Chapter TOC Validation Started: {ditamap_path} ===")
 
     try:
@@ -46,7 +46,7 @@ def validate_chapter_toc(ditamap_path: str) -> list:
         logger.debug(f"Found {len(chapters)} <chapter> elements in DITA map")
         if not chapters:
             logger.debug("No <chapter> elements found, returning empty results")
-            return results
+            return list(results)
 
         for chapter in chapters:
             chapter_href = chapter.get('href')
@@ -55,7 +55,7 @@ def validate_chapter_toc(ditamap_path: str) -> list:
 
             if not chapter_href:
                 logger.debug(f"Chapter {chapter_name} has no href attribute, adding to results")
-                results.append((chapter_name, "Missing href attribute", ""))
+                results.add((chapter_name, "Missing href attribute", ""))
                 continue
 
             chapter_file = urllib.parse.unquote(chapter_href).strip()
@@ -82,7 +82,7 @@ def validate_chapter_toc(ditamap_path: str) -> list:
             logger.debug(f"Collected topicrefs: {list(topicref_hrefs.keys())}")
             if not topicref_hrefs:
                 logger.debug(f"No valid first-level topicrefs found for chapter {chapter_name}, adding to results")
-                results.append((chapter_name, "No first-level topicrefs found", chapter_xml_path))
+                results.add((chapter_name, "No first-level topicrefs found", chapter_xml_path))
                 continue
 
             try:
@@ -92,11 +92,11 @@ def validate_chapter_toc(ditamap_path: str) -> list:
                 logger.debug(f"Successfully parsed chapter XML: {chapter_xml_path}")
             except ET.ParseError as e:
                 logger.debug(f"Chapter {chapter_name}: XML parsing error ({str(e)}), adding to results")
-                results.append((chapter_name, f"Chapter XML parsing error: {str(e)}", chapter_xml_path))
+                results.add((chapter_name, f"Chapter XML parsing error: {str(e)}", chapter_xml_path))
                 continue
             except FileNotFoundError:
                 logger.debug(f"Chapter {chapter_name}: XML file not found, adding to results")
-                results.append((chapter_name, "Chapter XML not found", chapter_xml_path))
+                results.add((chapter_name, "Chapter XML not found", chapter_xml_path))
                 continue
 
             ul_xref_hrefs = set()
@@ -135,33 +135,33 @@ def validate_chapter_toc(ditamap_path: str) -> list:
                         title_elem = topic_tree.find(".//title")
                         topic_title = title_elem.text.strip() if title_elem is not None and title_elem.text else topic_file
                         logger.debug(f"Adding result: Missing topic '{topic_title}' in chapter {chapter_name}")
-                        results.append((chapter_name, f"Missing: {topic_title}", chapter_xml_path))
+                        results.add((chapter_name, f"Missing: {topic_title}", chapter_xml_path))
                     except FileNotFoundError:
                         logger.debug(f"Topic {topic_file}: XML file not found, adding to results")
-                        results.append((chapter_name, f"Missing: {topic_file} (Topic XML not found)", chapter_xml_path))
+                        results.add((chapter_name, f"Missing: {topic_file} (Topic XML not found)", chapter_xml_path))
                     except ET.ParseError:
                         logger.debug(f"Topic {topic_file}: XML parsing error, adding to results")
-                        results.append((chapter_name, f"Missing: {topic_file} (Topic XML parsing error)", chapter_xml_path))
+                        results.add((chapter_name, f"Missing: {topic_file} (Topic XML parsing error)", chapter_xml_path))
 
         logger.debug(f"=== Chapter TOC Validation Complete ===\nIssues found: {len(results)}")
         for result in results:
             logger.debug(f"Result: Chapter={result[0]}, Issue={result[1]}, XML Path={result[2]}")
         if not results:
             logger.debug("No chapter TOC issues found")
-        return results
+        return list(results)
 
     except ET.ParseError as e:
         logger.debug(f"Error parsing DITA map file {ditamap_path}: {str(e)}")
-        results.append(("Error", f"DITA map parsing error: {str(e)}", ditamap_path))
-        return results
+        results.add(("Error", f"DITA map parsing error: {str(e)}", ditamap_path))
+        return list(results)
     except FileNotFoundError:
         logger.debug(f"DITA map file not found: {ditamap_path}")
-        results.append(("Error", "DITA map not found", ditamap_path))
-        return results
+        results.add(("Error", "DITA map not found", ditamap_path))
+        return list(results)
     except Exception as e:
         logger.debug(f"Unexpected error in DITA map: {ditamap_path}: {str(e)}")
-        results.append(("Error", f"Unexpected error: {str(e)}", ditamap_path))
-        return results
+        results.add(("Error", f"Unexpected error: {str(e)}", ditamap_path))
+        return list(results)
 
 def validate_subchapter_toc(ditamap_path: str) -> list:
     """
@@ -171,7 +171,7 @@ def validate_subchapter_toc(ditamap_path: str) -> list:
     Relax intro phrase check for topics with 'Commands' in the title.
     """
     logger = setup_logging(ditamap_path)
-    results = []
+    results = set()  # Use set for unique results
     logger.debug(f"=== Subchapter TOC Validation Started: {ditamap_path} ===")
 
     def get_immediate_topicrefs(topicref):
@@ -358,14 +358,14 @@ def validate_subchapter_toc(ditamap_path: str) -> list:
                 title_elem = topic_tree.find(".//title")
                 subtopic_title = title_elem.text.strip() if title_elem is not None and title_elem.text else os.path.basename(href)
                 issue = (parent_name, f"Missing: {subtopic_title}", parent_xml_path, topic_path)
-                results.append(issue)
+                results.add(issue)
                 logger.debug(f"{parent_name.upper()}: Adding result: Missing Subtopic: Chapter={parent_name}, Subtopic={subtopic_title}, XML={parent_xml_path}")
             except FileNotFoundError:
                 logger.debug(f"{parent_name.upper()}: Missing Subtopic: Chapter={parent_name}, Subtopic={href} (Topic XML not found), XML={parent_xml_path}")
-                results.append((parent_name, f"Missing: {href} (Topic XML not found)", parent_xml_path, topic_path))
+                results.add((parent_name, f"Missing: {href} (Topic XML not found)", parent_xml_path, topic_path))
             except ET.ParseError:
                 logger.debug(f"{parent_name.upper()}: Missing Subtopic: Chapter={parent_name}, Subtopic={href} (Topic XML parsing error), XML={parent_xml_path}")
-                results.append((parent_name, f"Missing: {href} (Topic XML parsing error)", parent_xml_path, topic_path))
+                results.add((parent_name, f"Missing: {href} (Topic XML parsing error)", parent_xml_path, topic_path))
 
         for child_topicref in immediate_topicrefs:
             if get_immediate_topicrefs(child_topicref):
@@ -393,17 +393,20 @@ def validate_subchapter_toc(ditamap_path: str) -> list:
             logger.debug(f"Result: Chapter={result[0]}, Issue={result[1]}, Parent XML={result[2]}, Subtopic Path={result[3]}")
         if not results:
             logger.debug("No subchapter TOC issues found")
-        return results
+        return list(results)
 
     except ET.ParseError as e:
         logger.debug(f"Error parsing DITA map file {ditamap_path}: {str(e)}")
-        return [("Error", f"DITA map parsing error: {str(e)}", ditamap_path, "")]
+        results.add(("Error", f"DITA map parsing error: {str(e)}", ditamap_path, ""))
+        return list(results)
     except FileNotFoundError:
         logger.debug(f"DITA map file not found: {ditamap_path}")
-        return [("Error", "DITA map not found", ditamap_path, "")]
+        results.add(("Error", "DITA map not found", ditamap_path, ""))
+        return list(results)
     except Exception as e:
         logger.debug(f"Unexpected error in DITA map: {ditamap_path}: {str(e)}")
-        return [("Error", f"Unexpected error: {str(e)}", ditamap_path, "")]
+        results.add(("Error", f"Unexpected error: {str(e)}", ditamap_path, ""))
+        return list(results)
 
 def get_immediate_topicrefs(topicref):
     """Collect only immediate <topicref> children with href attributes."""

@@ -9,6 +9,7 @@ from image_report import scan_images_for_resizing
 from file_numbers import move_file_to_trash
 from markdown_viewer import MarkdownViewer
 from pathlib import Path
+from network_utils import get_network_drive_info
 import time
 import re
 from lxml import etree
@@ -18,8 +19,9 @@ import io
 import tempfile
 import logging
 
-# Configure logging
-logging.basicConfig(level=logging.DEBUG, filename="image_sanity.log", format="%(asctime)s - %(levelname)s - %(message)s")
+# Configure logging to INFO to suppress DEBUG
+logging.basicConfig(level=logging.INFO, filename="image_sanity.log", format="%(asctime)s - %(levelname)s - %(message)s")
+logging.getLogger("PIL").setLevel(logging.WARNING)
 
 class CheckImageSanityWidget(QWidget):
     first_link_update = True
@@ -279,6 +281,23 @@ class CheckImageSanityWidget(QWidget):
         self.directory_path = QFileDialog.getExistingDirectory(self, "Select Directory", "")
         if not self.directory_path:
             return
+        
+        # Check for network drive and warn user
+        network_info = get_network_drive_info(self.directory_path)
+        if network_info['is_network']:
+            msg_box = QMessageBox(self)
+            msg_box.setWindowTitle("Network Drive Detected")
+            msg_box.setIcon(QMessageBox.Icon.Warning)
+            msg_box.setText(network_info['warning_message'])
+            msg_box.setInformativeText(network_info['recommendation'])
+            msg_box.setStandardButtons(QMessageBox.StandardButton.Ok | QMessageBox.StandardButton.Cancel)
+            msg_box.setDefaultButton(QMessageBox.StandardButton.Ok)
+            
+            result = msg_box.exec()
+            if result == QMessageBox.StandardButton.Cancel:
+                self.feedback_label.setText("Operation cancelled")
+                return
+        
         self.refresh_non_png_images()
 
     def refresh_non_png_images(self):
@@ -319,6 +338,23 @@ class CheckImageSanityWidget(QWidget):
         self.directory_path = QFileDialog.getExistingDirectory(self, "Select Directory", "")
         if not self.directory_path:
             return
+        
+        # Check for network drive and warn user
+        network_info = get_network_drive_info(self.directory_path)
+        if network_info['is_network']:
+            msg_box = QMessageBox(self)
+            msg_box.setWindowTitle("Network Drive Detected")
+            msg_box.setIcon(QMessageBox.Icon.Warning)
+            msg_box.setText(network_info['warning_message'])
+            msg_box.setInformativeText(network_info['recommendation'])
+            msg_box.setStandardButtons(QMessageBox.StandardButton.Ok | QMessageBox.StandardButton.Cancel)
+            msg_box.setDefaultButton(QMessageBox.StandardButton.Ok)
+            
+            result = msg_box.exec()
+            if result == QMessageBox.StandardButton.Cancel:
+                self.feedback_label.setText("Operation cancelled")
+                return
+        
         self.refresh_image_sizes()
 
     def refresh_image_sizes(self):
@@ -334,11 +370,24 @@ class CheckImageSanityWidget(QWidget):
         self.refresh_btn.setVisible(False)
         try:
             self.image_files, total_images_scanned, images_to_be_resized = scan_images_for_resizing(self.directory_path)
+            # Filter out images where DPI is approximately 144 but flagged due to floating point
+            filtered_files = []
+            for file_path, relative_path, reason in self.image_files:
+                try:
+                    with Image.open(file_path) as img:
+                        dpi = img.info.get('dpi', (0, 0))
+                        if "DPI" in reason and round(dpi[0]) == 144 and round(dpi[1]) == 144:
+                            continue  # Do not flag
+                        filtered_files.append((file_path, relative_path, reason))
+                except Exception:
+                    filtered_files.append((file_path, relative_path, reason))
+            self.image_files = filtered_files
+            images_to_be_resized = len(self.image_files)
             for row, (file_path, relative_path, reason) in enumerate(self.image_files):
                 file_name = os.path.basename(file_path)
                 self.add_table_row(file_name, relative_path, reason, file_path)
             self.table.setVisible(True)
-            self.feedback_label.setText(f"{images_to_be_resized} Images out of {total_images_scanned} Images need resizing")
+            self.feedback_label.setText(f"{images_to_be_resized} Images out of {total_images_scanned} Images need fixing")
             self.fix_image_btn.setVisible(images_to_be_resized > 0)
             self.refresh_btn.setVisible(True)
         except Exception as e:
@@ -347,7 +396,7 @@ class CheckImageSanityWidget(QWidget):
             self.table.setVisible(True)
             self.refresh_btn.setVisible(True)
         if not self.image_files:
-            self.feedback_label.setText("No images need resizing")
+            self.feedback_label.setText("No images need fixing")
             self.table.setVisible(False)
 
     def convert_to_png(self):
@@ -376,29 +425,22 @@ class CheckImageSanityWidget(QWidget):
         for row, (file_path, relative_path, reason) in enumerate(self.image_files):
             if "Converted to PNG" in reason or "Error" in reason:
                 continue
-            logging.debug(f"Before conversion: row={row}, file_path={file_path}, relative_path={relative_path}, reason={reason}")
             try:
                 new_file_path, error = convert_to_png(file_path, parent_dir)
-                logging.debug(f"After conversion: file_path={file_path}, new_file_path={new_file_path}, error={error}")
                 if error:
                     self.table.setItem(row, 2, QTableWidgetItem(f"Error: {error}"))
-                    logging.error(f"Conversion failed for {file_path}: {error}")
                     continue
                 if not os.path.exists(new_file_path):
                     self.table.setItem(row, 2, QTableWidgetItem("Error: Converted PNG not found"))
-                    logging.error(f"Converted PNG not found: {new_file_path}")
                     continue
                 if not os.access(new_file_path, os.R_OK):
                     self.table.setItem(row, 2, QTableWidgetItem("Error: No read permission for PNG"))
-                    logging.error(f"No read permission for converted PNG: {new_file_path}")
                     continue
                 new_file_name = os.path.basename(new_file_path)
                 new_image_files[row] = (new_file_path, relative_path, "Converted to PNG")
                 converted_count += 1
-                logging.debug(f"Updated image_files[{row}] = {(new_file_path, relative_path, 'Converted to PNG')}")
             except Exception as e:
                 self.table.setItem(row, 2, QTableWidgetItem(f"Error: {str(e)}"))
-                logging.error(f"Unexpected error during conversion of {file_path}: {str(e)}")
         self.image_files = new_image_files  # Update image_files after all conversions
         # Refresh table to update View button connections
         self.table.setRowCount(0)
@@ -416,18 +458,14 @@ class CheckImageSanityWidget(QWidget):
         if file_path is None:
             if row is None or row < 0 or row >= len(self.image_files):
                 self.feedback_label.setText("Error: Invalid row selected for viewing.")
-                logging.error(f"Invalid row for viewing: row={row}, image_files length={len(self.image_files)}")
                 return
             file_path = self.image_files[row][0]
-        logging.debug(f"Attempting to view file: file_path={file_path}")
         file_name = os.path.basename(file_path)
         if not os.path.exists(file_path):
             self.feedback_label.setText(f"Error: File not found: {file_name}")
-            logging.error(f"File not found for viewing: {file_path}")
             return
         if not os.access(file_path, os.R_OK):
             self.feedback_label.setText(f"Error: No read permission for {file_name}")
-            logging.error(f"No read permission for file: {file_path}")
             return
         try:
             system = platform.system()
@@ -457,10 +495,8 @@ class CheckImageSanityWidget(QWidget):
                     self.feedback_label.setText(f"Error: Unsupported OS for viewing {file_name}")
         except subprocess.CalledProcessError as e:
             self.feedback_label.setText(f"Error opening {file_name}: {str(e)}")
-            logging.error(f"Subprocess error opening {file_path}: {str(e)}")
         except Exception as e:
             self.feedback_label.setText(f"Error opening {file_name}: {str(e)}")
-            logging.error(f"Unexpected error opening {file_path}: {str(e)}")
 
     def fix_images(self):
         images_to_fix = len(self.image_files)
@@ -488,62 +524,82 @@ class CheckImageSanityWidget(QWidget):
             try:
                 file_name = os.path.basename(file_path)
                 legacy_path = os.path.join(graphics_folder, file_name)
-                if file_path.lower().endswith('.png') and not os.path.exists(legacy_path):
-                    shutil.copy2(file_path, legacy_path)
-                elif file_path.lower().endswith(('.jpg', '.jpeg')) and not os.path.exists(legacy_path):
+                if file_path.lower().endswith(('.png', '.jpg', '.jpeg')) and not os.path.exists(legacy_path):
                     shutil.copy2(file_path, legacy_path)
 
                 if not os.access(file_path, os.W_OK):
                     raise PermissionError(f"No write permission for {file_path}")
 
-                # Open image without verification
+                # Open image without converting mode
                 with Image.open(file_path) as img:
-                    if img.mode != 'RGB':
-                        img = img.convert('RGB')
                     width, height = img.size
                     modified = False
+                    dpi = img.info.get('dpi', (0, 0))
+                    if round(dpi[0]) != 144 or round(dpi[1]) != 144:
+                        modified = True
 
-                    # Resize if width or height > 1000
-                    if width > 1000 or height > 1000:
-                        scale = min(999 / width, 999 / height)
+                    # Resize if width or height > 972
+                    if width > 972 or height > 972:
+                        scale = min(972 / max(width, height), 1)
                         new_width = int(width * scale)
                         new_height = int(height * scale)
                         img = img.resize((new_width, new_height), Image.Resampling.LANCZOS)
                         img = ImageEnhance.Sharpness(img).enhance(1.5)
                         modified = True
 
-                    # Save to temporary file
+                    # Save to temporary file as PNG with DPI 144
                     with tempfile.NamedTemporaryFile(suffix='.png', delete=False) as temp_file:
                         temp_path = temp_file.name
-                        img.save(temp_path, format='PNG', compress_level=9)
+                        img.save(temp_path, format='PNG', dpi=(144, 144), compress_level=9, optimize=True)
                         size_mb = os.path.getsize(temp_path) / (1024 * 1024)
 
-                        # Reduce quality if size > 1MB
+                        # Reduce if size > 1MB, handling transparency
                         if size_mb > 1:
-                            quality = 100
-                            while size_mb > 1 and quality >= 10:
-                                buffer = io.BytesIO()
-                                img.save(buffer, format='PNG', compress_level=9, quality=quality)
-                                buffer.seek(0)
-                                with open(temp_path, 'wb') as f:
-                                    f.write(buffer.getvalue())
-                                size_mb = os.path.getsize(temp_path) / (1024 * 1024)
-                                quality -= 2
-                                modified = True
+                            if img.mode == 'RGBA':
+                                # Separate alpha and quantize RGB
+                                alpha = img.split()[3]
+                                rgb_img = img.convert('RGB')
+                                rgb_img = rgb_img.quantize(colors=256, method=Image.Quantize.MEDIANCUT)
+                                rgb_img = rgb_img.convert('RGBA')
+                                rgb_img.putalpha(alpha)
+                                img = rgb_img
+                            else:
+                                img = img.quantize(colors=256, method=Image.Quantize.MEDIANCUT)
+                            img.save(temp_path, format='PNG', dpi=(144, 144), compress_level=9, optimize=True)
+                            size_mb = os.path.getsize(temp_path) / (1024 * 1024)
+                            if size_mb > 1:
+                                # Further reduce by resizing slightly if needed
+                                scale = min((1 / size_mb) ** 0.5, 1)
+                                new_width = int(width * scale)
+                                new_height = int(height * scale)
+                                img = img.resize((new_width, new_height), Image.Resampling.LANCZOS)
+                                img.save(temp_path, format='PNG', dpi=(144, 144), compress_level=9, optimize=True)
+                            modified = True
 
-                    # Move temp file to original path if modified
-                    if modified:
-                        shutil.move(temp_path, file_path)
+                    # Move temp file to original path if modified, ensure .png extension
+                    new_file_path = file_path if file_path.lower().endswith('.png') else os.path.splitext(file_path)[0] + '.png'
+                    if modified or file_path != new_file_path:
+                        shutil.move(temp_path, new_file_path)
+                        if file_path != new_file_path:
+                            os.remove(file_path)
+                            self.image_files[row] = (new_file_path, relative_path, "Fixed")
+                        # Check DPI after save
+                        with Image.open(new_file_path) as saved_img:
+                            saved_dpi = saved_img.info.get('dpi', (0, 0))
+                            if round(saved_dpi[0]) == 144 and round(saved_dpi[1]) == 144:
+                                print(f"DPI set to 144 for {file_name}")
+                            else:
+                                print(f"could not be set due to value: {saved_dpi} for {file_name}")
                         fixed_count += 1
-                        self.table.setItem(row, 2, QTableWidgetItem("Resized"))
-                        self.image_files[row] = (file_path, relative_path, "Resized")
-                        log_path = relative_path + file_name
+                        self.table.setItem(row, 2, QTableWidgetItem("Fixed"))
+                        self.image_files[row] = (new_file_path, relative_path, "Fixed")
+                        log_path = relative_path + os.path.basename(new_file_path)
                         try:
                             with open(log_file, "a", encoding="utf-8") as f:
                                 if CheckImageSanityWidget.first_resize:
-                                    f.write("--------------\nImages Resized:\n")
+                                    f.write("--------------\nImages Fixed:\n")
                                     CheckImageSanityWidget.first_resize = False
-                                f.write(f"{log_path} - resized\n")
+                                f.write(f"{log_path} - fixed\n")
                         except Exception:
                             pass
                     else:
@@ -601,7 +657,6 @@ class CheckImageSanityWidget(QWidget):
                                     if orig_id:
                                         new_id = f"ttu_{orig_id}"
                                         root_elem.set('id', new_id)
-                                        logging.debug(f"Updated ID from {orig_id} to {new_id} in {file_path}")
                                     rel_path = os.path.relpath(file_path, parent_dir).replace(os.sep, '/')
                                     backup_path = os.path.join(legacy_folder, rel_path)
                                     if not os.path.exists(backup_path):
@@ -659,7 +714,6 @@ class CheckImageSanityWidget(QWidget):
         reason_item = QTableWidgetItem(reason)
         reason_item.setToolTip(reason)
         self.table.setItem(row, 2, reason_item)
-        logging.debug(f"Adding table row: row={row}, file_name={file_name}, folder_path={folder_path}, reason={reason}, file_path={file_path}")
         if file_path:
             view_btn = QPushButton("View")
             view_btn.setFont(QFont("Helvetica", 9))
